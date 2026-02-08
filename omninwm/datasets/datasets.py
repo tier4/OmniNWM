@@ -802,9 +802,10 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
                 data_index_list = self.data[self.infer_index]
             else:
                 data_index_list = self.data[index]
-
-            start_index = data_index_list[0]
-            data_infos = self.data_infos[start_index : start_index + num_frames]
+            # NOTE:
+            # The clip sampler may return non-contiguous frame indices (e.g., custom scene token lists).
+            # Always gather frames by explicit indices instead of assuming contiguous slices.
+            data_infos = [self.data_infos[data_idx] for data_idx in data_index_list[:num_frames]]
 
         # 初始化返回字典和存储列表
         ret = {}

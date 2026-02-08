@@ -12,23 +12,6 @@ from omninwm.utils.misc import format_numel_str
 from omninwm.datasets.aspect import get_num_pexels_from_name
 from omninwm.datasets.bucket import Bucket
 from omninwm.datasets.datasets import NuscenesVideoDataset
-from omninwm.datasets.parallel import pandarallel
-from omninwm.datasets.utils import sync_object_across_devices
-from IPython import embed
-
-
-# use pandarallel to accelerate bucket processing
-# NOTE: pandarallel should only access local variables
-def apply(data, method=None, seed=None, num_bucket=None, fps_max=16):
-    return method(
-        data["num_frames"],
-        data["height"],
-        data["width"],
-        data["fps"],
-        data["path"],
-        seed + data["id"] * num_bucket,
-        fps_max,
-    )
 
 class VariableVideoBatchSampler(DistributedSampler):
     def __init__(
@@ -56,14 +39,6 @@ class VariableVideoBatchSampler(DistributedSampler):
         self._cached_bucket_sample_dict = None
         self._cached_num_total_batch = None
         self.num_groups = num_groups
-
-        if dist.get_rank() == 0:
-            pandarallel.initialize(
-                nb_workers=self.num_bucket_build_workers,
-                progress_bar=False,
-                verbose=0,
-                use_memory_fs=False,
-            )
 
     def __iter__(self) -> Iterator[list[int]]:
         bucket_sample_dict, _ = self.group_by_bucket()
@@ -185,28 +160,28 @@ class VariableVideoBatchSampler(DistributedSampler):
         if self._cached_bucket_sample_dict is not None:
             return self._cached_bucket_sample_dict, self._cached_num_total_batch
 
-        # use pandarallel to accelerate bucket processing
-        log_message("Building buckets using %d workers...", self.num_bucket_build_workers)
+        # NOTE:
+        # Avoid process-fork based parallel bucket building after CUDA/NCCL init.
+        # Forking at this stage can corrupt CUDA state and cause NCCL failures.
+        log_message("Building buckets on each rank (deterministic local build)")
         bucket_ids = []
-        if dist.get_rank() == 0:
-            data = self.dataset.data
-            video_attr_list = self.dataset.video_attr_list
-            for i in range(len(data)):
-                video_attr = np.random.choice(video_attr_list)
-                video_height = video_attr['height']
-                video_width = video_attr['width']
-                video_frames = video_attr['frames']
-                bucket_ids.append(self.bucket.get_bucket_id(
-                    video_frames,
-                    video_height,
-                    video_width,
-                    12,
-                    self.seed + self.epoch + i * self.bucket.num_bucket,
-                    12
-                ))
-        dist.barrier()
-        bucket_ids = sync_object_across_devices(bucket_ids)
-        dist.barrier()
+        data = self.dataset.data
+        video_attr_list = self.dataset.video_attr_list
+        rng = np.random.default_rng(self.seed + self.epoch)
+        num_video_attrs = len(video_attr_list)
+        for i in range(len(data)):
+            video_attr = video_attr_list[int(rng.integers(num_video_attrs))]
+            video_height = video_attr['height']
+            video_width = video_attr['width']
+            video_frames = video_attr['frames']
+            bucket_ids.append(self.bucket.get_bucket_id(
+                video_frames,
+                video_height,
+                video_width,
+                12,
+                self.seed + self.epoch + i * self.bucket.num_bucket,
+                12
+            ))
         # group by bucket
         # each data sample is put into a bucket with a similar image/video size
         bucket_sample_dict = defaultdict(list)

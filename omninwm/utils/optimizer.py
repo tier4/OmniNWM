@@ -7,6 +7,7 @@ from torch.optim.lr_scheduler import _LRScheduler
 def create_optimizer(
     model: torch.nn.Module,
     optimizer_config: dict,
+    param_groups: list[dict] | None = None,
 ) -> torch.optim.Optimizer:
     """
     Create an optimizer.
@@ -18,14 +19,20 @@ def create_optimizer(
     Returns:
         torch.optim.Optimizer: The optimizer.
     """
-    optimizer_name = optimizer_config.pop("cls", "HybridAdam")
+    optimizer_cfg = dict(optimizer_config)
+    optimizer_name = optimizer_cfg.pop("cls", "HybridAdam")
     if optimizer_name == "HybridAdam":
         optimizer_cls = HybridAdam
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_name}")
+    params = (
+        param_groups
+        if param_groups is not None
+        else filter(lambda p: p.requires_grad, model.parameters())
+    )
     optimizer = optimizer_cls(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        **optimizer_config,
+        params,
+        **optimizer_cfg,
     )
     return optimizer
 

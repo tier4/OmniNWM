@@ -1,5 +1,6 @@
 from IPython import embed
 import gc
+import fnmatch
 import math
 import os
 import random
@@ -7,6 +8,7 @@ import subprocess
 import warnings
 from contextlib import nullcontext
 from copy import deepcopy
+from pathlib import Path
 from pprint import pformat
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -72,6 +74,194 @@ from omninwm.utils.train import (
 )
 torch.backends.cudnn.benchmark = False  # True leads to slow down in conv3d
 
+
+def _flatten_mlflow_params(data, prefix=""):
+    flat = {}
+    if isinstance(data, dict):
+        for key, value in data.items():
+            key = str(key)
+            full_key = f"{prefix}.{key}" if prefix else key
+            if isinstance(value, dict):
+                flat.update(_flatten_mlflow_params(value, full_key))
+            else:
+                if isinstance(value, (list, tuple)):
+                    value = str(value)
+                elif value is None:
+                    value = "None"
+                elif not isinstance(value, (str, int, float, bool)):
+                    value = str(value)
+                value = str(value)
+                # MLflow param key/value length limits
+                flat[full_key[:240]] = value[:500]
+    return flat
+
+
+def _normalize_mlflow_tracking_uri(tracking_uri: str, project_root: Path) -> str:
+    if not tracking_uri:
+        tracking_uri = "sqlite:///mlruns/mlflow.db"
+
+    if tracking_uri.startswith("sqlite:///"):
+        db_path = tracking_uri[len("sqlite:///") :]
+        if not os.path.isabs(db_path):
+            db_path = str(project_root / db_path)
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        tracking_uri = f"sqlite:///{db_path}"
+    return tracking_uri
+
+
+def _normalize_mlflow_artifact_location(artifact_location: str, project_root: Path):
+    if artifact_location is None:
+        return None
+    if "://" in artifact_location:
+        return artifact_location
+    if not os.path.isabs(artifact_location):
+        artifact_location = str(project_root / artifact_location)
+    os.makedirs(artifact_location, exist_ok=True)
+    return artifact_location
+
+
+def _log_mlflow_params_safely(mlflow_client, params: dict):
+    items = list(params.items())
+    if not items:
+        return
+    chunk_size = 100
+    for start in range(0, len(items), chunk_size):
+        mlflow_client.log_params(dict(items[start : start + chunk_size]))
+
+
+def _matches_pattern(name: str, pattern: str) -> bool:
+    if any(ch in pattern for ch in "*?[]"):
+        return fnmatch.fnmatch(name, pattern)
+    return pattern in name
+
+
+def _matches_any_pattern(name: str, patterns: list[str]) -> bool:
+    return any(_matches_pattern(name, p) for p in patterns)
+
+
+def _configure_finetune_params(model: torch.nn.Module, cfg, logger):
+    freeze_cfg = cfg.get("freeze_strategy", None)
+    if not freeze_cfg or not freeze_cfg.get("enable", False):
+        return None
+
+    named_params = list(model.named_parameters())
+
+    freeze_patterns = list(freeze_cfg.get("freeze_patterns", []))
+    if freeze_cfg.get("freeze_transformer_blocks", False):
+        freeze_patterns.extend(["double_blocks.*", "single_blocks.*"])
+
+    unfreeze_patterns = list(freeze_cfg.get("unfreeze_patterns", []))
+    if freeze_cfg.get("unfreeze_cross_view", False):
+        unfreeze_patterns.extend(
+            [
+                "single_blocks.*.q_mv_proj*",
+                "single_blocks.*.k_mv_proj*",
+                "single_blocks.*.v_mv_mlp*",
+                "single_blocks.*.linear_mv*",
+                "single_blocks.*.connector*",
+            ]
+        )
+
+    if freeze_cfg.get("freeze_all", True):
+        for _, p in named_params:
+            p.requires_grad = False
+
+    if freeze_patterns:
+        for name, p in named_params:
+            if _matches_any_pattern(name, freeze_patterns):
+                p.requires_grad = False
+
+    if unfreeze_patterns:
+        for name, p in named_params:
+            if _matches_any_pattern(name, unfreeze_patterns):
+                p.requires_grad = True
+
+    trainable = [name for name, p in named_params if p.requires_grad]
+    frozen = [name for name, p in named_params if not p.requires_grad]
+    logger.info(
+        "Freeze strategy applied. trainable=%s frozen=%s",
+        len(trainable),
+        len(frozen),
+    )
+    if trainable:
+        logger.info("Trainable param samples: %s", trainable[:30])
+
+    param_groups_cfg = freeze_cfg.get("param_groups", None)
+    if not param_groups_cfg:
+        return None
+
+    base_lr = float(cfg.optim.lr)
+    default_wd = float(cfg.optim.get("weight_decay", 0.0))
+    assigned_names = set()
+    param_groups = []
+
+    for idx, group_cfg in enumerate(param_groups_cfg):
+        patterns = list(group_cfg.get("patterns", []))
+        if not patterns:
+            continue
+        group_name = group_cfg.get("name", f"group_{idx}")
+        group_lr = float(group_cfg.get("lr", base_lr * float(group_cfg.get("lr_mult", 1.0))))
+        group_wd = float(group_cfg.get("weight_decay", default_wd))
+        params = []
+        names = []
+        for name, p in named_params:
+            if (not p.requires_grad) or (name in assigned_names):
+                continue
+            if _matches_any_pattern(name, patterns):
+                params.append(p)
+                names.append(name)
+                assigned_names.add(name)
+        if params:
+            param_groups.append(
+                {
+                    "name": group_name,
+                    "params": params,
+                    "lr": group_lr,
+                    "weight_decay": group_wd,
+                }
+            )
+            logger.info(
+                "Param group %s: %s tensors, lr=%s, weight_decay=%s",
+                group_name,
+                len(params),
+                group_lr,
+                group_wd,
+            )
+            logger.info("Param group %s samples: %s", group_name, names[:20])
+        else:
+            logger.warning("Param group %s matched 0 parameters.", group_name)
+
+    remaining_params = []
+    remaining_names = []
+    for name, p in named_params:
+        if p.requires_grad and name not in assigned_names:
+            remaining_params.append(p)
+            remaining_names.append(name)
+
+    if remaining_params:
+        param_groups.append(
+            {
+                "name": "default",
+                "params": remaining_params,
+                "lr": base_lr,
+                "weight_decay": default_wd,
+            }
+        )
+        logger.info(
+            "Default param group: %s tensors, lr=%s, weight_decay=%s",
+            len(remaining_params),
+            base_lr,
+            default_wd,
+        )
+        logger.info("Default param group samples: %s", remaining_names[:20])
+
+    # torch optimizer does not support "name" key in groups
+    for group in param_groups:
+        group.pop("name", None)
+
+    return param_groups
+
+
 def main():
     # ======================================================
     # 1. configs & runtime variables
@@ -127,6 +317,8 @@ def main():
     logger = create_logger(exp_dir)
     logger.info("Training configuration:\n %s", pformat(cfg.to_dict()))
     tb_writer = None
+    mlflow_client = None
+    mlflow_active = False
     if coordinator.is_master():
         tb_writer = create_tensorboard_writer(exp_dir)
         if cfg.get("wandb", False):
@@ -185,6 +377,7 @@ def main():
     model = build_module(cfg.model, MODELS, device_map=device, torch_dtype=dtype).train()
     if cfg.get("grad_checkpoint", True):
         set_grad_checkpoint(model)
+    optimizer_param_groups = _configure_finetune_params(model, cfg, logger)
     log_cuda_memory("diffusion")
     log_model_params(model)
 
@@ -205,7 +398,7 @@ def main():
     model_ae.encode = torch.compile(model_ae.encoder, dynamic=True)
 
     # == setup optimizer ==
-    optimizer = create_optimizer(model, cfg.optim)
+    optimizer = create_optimizer(model, cfg.optim, param_groups=optimizer_param_groups)
 
     # == setup lr scheduler ==
     lr_scheduler = create_lr_scheduler(
@@ -306,6 +499,75 @@ def main():
         model_sharding(ema)
         ema = ema.to(device)
         log_cuda_memory("sharding EMA")
+
+    # == init mlflow ==
+    if coordinator.is_master() and cfg.get("mlflow", False):
+        import mlflow
+
+        project_root = Path(__file__).resolve().parents[1]
+        tracking_uri = _normalize_mlflow_tracking_uri(
+            cfg.get("mlflow_tracking_uri", "sqlite:///mlruns/mlflow.db"),
+            project_root,
+        )
+        artifact_location = _normalize_mlflow_artifact_location(
+            cfg.get("mlflow_artifact_location", "mlruns/artifacts"),
+            project_root,
+        )
+
+        mlflow.set_tracking_uri(tracking_uri)
+        experiment_name = cfg.get("mlflow_experiment", "omninwm")
+        try:
+            if artifact_location is not None:
+                client = mlflow.tracking.MlflowClient()
+                exp = client.get_experiment_by_name(experiment_name)
+                if exp is None:
+                    try:
+                        client.create_experiment(
+                            name=experiment_name,
+                            artifact_location=artifact_location,
+                        )
+                    except TypeError:
+                        # Older/newer MLflow API compatibility.
+                        client.create_experiment(name=experiment_name)
+            mlflow.set_experiment(experiment_name=experiment_name)
+        except Exception as e:
+            logger.warning(
+                "Failed to set MLflow experiment with artifact_location (%s), fallback to default. err=%s",
+                artifact_location,
+                e,
+            )
+            mlflow.set_experiment(experiment_name)
+
+        mlflow_run_name = cfg.get("mlflow_run_name", None) or exp_name
+        mlflow.start_run(run_name=mlflow_run_name)
+        mlflow_active = True
+        mlflow_client = mlflow
+
+        mlflow.set_tag("status", "RUNNING")
+        mlflow.set_tag("exp_name", exp_name)
+        mlflow.set_tag("exp_dir", exp_dir)
+        mlflow.set_tag("config_path", cfg.get("config_path", ""))
+        mlflow.set_tag("plugin", str(plugin_type))
+        mlflow.set_tag("num_gpus", str(num_gpus))
+        mlflow.set_tag("num_steps_per_epoch", str(num_steps_per_epoch))
+
+        tags = cfg.get("mlflow_tags", None)
+        if isinstance(tags, dict):
+            mlflow.set_tags({str(k): str(v) for k, v in tags.items()})
+
+        flat_cfg = _flatten_mlflow_params(cfg.to_dict())
+        _log_mlflow_params_safely(mlflow, flat_cfg)
+        mlflow.log_metric("dataset_size", len(dataset), step=0)
+
+        config_path = os.path.join(exp_dir, "config.txt")
+        if os.path.exists(config_path):
+            mlflow.log_artifact(config_path, artifact_path="config")
+        logger.info(
+            "MLflow enabled. tracking_uri=%s, experiment=%s, run_name=%s",
+            tracking_uri,
+            experiment_name,
+            mlflow_run_name,
+        )
 
     # =======================================================
     # 5. training iter
@@ -417,7 +679,6 @@ def main():
         
         loss_item = all_reduce_mean(loss.data.clone().detach()).item()
         # == backward & update ==
-        dist.barrier()
         with nsys.range("backward"), timers["backward"]:
             ctx = (
                 booster.no_sync(model, optimizer)
@@ -450,158 +711,195 @@ def main():
     # =======================================================
     # 6. training loop
     # =======================================================
-    dist.barrier()
-    for epoch in range(start_epoch, cfg_epochs):
+    run_status = "RUNNING"
+    try:
+        for epoch in range(start_epoch, cfg_epochs):
         # == set dataloader to new epoch ==
-        sampler.set_epoch(epoch)
-        dataloader_iter = iter(dataloader)
-        logger.info("Beginning epoch %s...", epoch)
+            sampler.set_epoch(epoch)
+            dataloader_iter = iter(dataloader)
+            logger.info("Beginning epoch %s...", epoch)
 
         # == training loop in an epoch ==
-        with tqdm(
-            enumerate(dataloader_iter, start=start_step),
-            desc=f"Epoch {epoch}",
-            disable=not is_log_process(plugin_type, plugin_config),
-            initial=start_step,
-            total=num_steps_per_epoch,
-        ) as pbar:
-            pbar_iter = iter(pbar)
-            # prefetch one for non-blocking data loading
-            def fetch_data():
-                step, batch = next(pbar_iter)
-                pinned_video = batch["video"]
-                batch["video"] = pinned_video.to(device, dtype, non_blocking=True)
-                if batch.get('depth',None) is not None:
-                    pinned_depth = batch["depth"]
-                    batch["depth"] = pinned_depth.to(device, dtype, non_blocking=True)
-                if batch.get('seg',None) is not None:
-                    pinned_seg_video = batch["seg"]
-                    batch["seg"] = pinned_seg_video.to(device, dtype, non_blocking=True)
-                if batch.get('ray_map',None) is not None:
-                    pinned_ray_map = batch["ray_map"]
-                    batch["ray_map"] = pinned_ray_map.to(device, dtype, non_blocking=True)
+            with tqdm(
+                enumerate(dataloader_iter, start=start_step),
+                desc=f"Epoch {epoch}",
+                disable=not is_log_process(plugin_type, plugin_config),
+                initial=start_step,
+                total=num_steps_per_epoch,
+            ) as pbar:
+                pbar_iter = iter(pbar)
+                # prefetch one for non-blocking data loading
+                def fetch_data():
+                    step, batch = next(pbar_iter)
+                    pinned_video = batch["video"]
+                    batch["video"] = pinned_video.to(device, dtype, non_blocking=True)
+                    if batch.get('depth',None) is not None:
+                        pinned_depth = batch["depth"]
+                        batch["depth"] = pinned_depth.to(device, dtype, non_blocking=True)
+                    if batch.get('seg',None) is not None:
+                        pinned_seg_video = batch["seg"]
+                        batch["seg"] = pinned_seg_video.to(device, dtype, non_blocking=True)
+                    if batch.get('ray_map',None) is not None:
+                        pinned_ray_map = batch["ray_map"]
+                        batch["ray_map"] = pinned_ray_map.to(device, dtype, non_blocking=True)
 
-                return batch, step, pinned_video
-            
-            batch_, step_, pinned_video_ = fetch_data()
+                    return batch, step, pinned_video
+                
+                batch_, step_, pinned_video_ = fetch_data()
 
-            for _ in range(start_step, num_steps_per_epoch):
-                nsys.step()
-                # == load data ===
-                with nsys.range("load_data"), timers["load_data"]:
-                    batch, step, pinned_video = batch_, step_, pinned_video_
-                    if step + 1 < num_steps_per_epoch:
-                        # only fetch new data if not last step
-                        batch_, step_, pinned_video_ = fetch_data()
-                # == run iter ==
-                with nsys.range("iter"), timers["iter"]:
-                    inp, x_0, x_1 = prepare_inputs(batch)
-                    if cache_pin_memory:
-                        dataloader_iter.remove_cache(pinned_video)
-                    loss = run_iter(inp, x_0, x_1)
+                for _ in range(start_step, num_steps_per_epoch):
+                    nsys.step()
+                    # == load data ===
+                    with nsys.range("load_data"), timers["load_data"]:
+                        batch, step, pinned_video = batch_, step_, pinned_video_
+                        if step + 1 < num_steps_per_epoch:
+                            # only fetch new data if not last step
+                            batch_, step_, pinned_video_ = fetch_data()
+                    # == run iter ==
+                    with nsys.range("iter"), timers["iter"]:
+                        inp, x_0, x_1 = prepare_inputs(batch)
+                        if cache_pin_memory:
+                            dataloader_iter.remove_cache(pinned_video)
+                        loss = run_iter(inp, x_0, x_1)
 
-                # == update log info ==
-                if loss is not None:
-                    running_loss += loss
+                    # == update log info ==
+                    if loss is not None:
+                        running_loss += loss
 
-                # == log config ==
-                global_step = epoch * num_steps_per_epoch + step
-                actual_update_step = (global_step + 1) // accumulation_steps
-                log_step += 1
-                acc_step += 1
+                    # == log config ==
+                    global_step = epoch * num_steps_per_epoch + step
+                    actual_update_step = (global_step + 1) // accumulation_steps
+                    log_step += 1
+                    acc_step += 1
 
-                # == logging ==
-                if (global_step + 1) % accumulation_steps == 0:
-                    if actual_update_step % cfg.get("log_every", 1) == 0:
-                        if is_log_process(plugin_type, plugin_config):
-                            avg_loss = running_loss / log_step
-                            # progress bar
-                            pbar.set_postfix(
-                                {
-                                    "loss": avg_loss,
-                                    "global_grad_norm": optimizer.get_grad_norm(),
-                                    "step": step,
-                                    "global_step": global_step,
-                                    # "actual_update_step": actual_update_step,
-                                    "lr": optimizer.param_groups[0]["lr"],
-                                }
+                    # == logging ==
+                    if (global_step + 1) % accumulation_steps == 0:
+                        if actual_update_step % cfg.get("log_every", 1) == 0:
+                            if is_log_process(plugin_type, plugin_config):
+                                avg_loss = running_loss / log_step
+                                global_grad_norm = optimizer.get_grad_norm()
+                                # progress bar
+                                pbar.set_postfix(
+                                    {
+                                        "loss": avg_loss,
+                                        "global_grad_norm": global_grad_norm,
+                                        "step": step,
+                                        "global_step": global_step,
+                                        # "actual_update_step": actual_update_step,
+                                        "lr": optimizer.param_groups[0]["lr"],
+                                    }
+                                )
+                                # tensorboard
+                                if tb_writer is not None:
+                                    tb_writer.add_scalar("loss", loss, actual_update_step)
+                                # wandb
+                                if cfg.get("wandb", False):
+                                    wandb_dict = {
+                                        "iter": global_step,
+                                        "acc_step": acc_step,
+                                        "epoch": epoch,
+                                        "loss": loss,
+                                        "avg_loss": avg_loss,
+                                        "lr": optimizer.param_groups[0]["lr"],
+                                        "eps": optimizer.param_groups[0]["eps"],
+                                        "global_grad_norm": global_grad_norm,
+                                    }
+                                    if cfg.get("record_time", False):
+                                        wandb_dict.update(timers.to_dict())
+                                    wandb.log(wandb_dict, step=actual_update_step)
+
+                                # mlflow
+                                if mlflow_active:
+                                    mlflow_metrics = {
+                                        "iter": global_step,
+                                        "acc_step": acc_step,
+                                        "epoch": epoch,
+                                        "loss": float(loss),
+                                        "avg_loss": float(avg_loss),
+                                        "lr": float(optimizer.param_groups[0]["lr"]),
+                                        "eps": float(optimizer.param_groups[0]["eps"]),
+                                        "global_grad_norm": float(global_grad_norm),
+                                    }
+                                    if cfg.get("record_time", False):
+                                        for key, value in timers.to_dict().items():
+                                            if isinstance(value, (int, float)):
+                                                mlflow_metrics[f"time/{key}"] = float(value)
+                                    mlflow_client.log_metrics(mlflow_metrics, step=actual_update_step)
+
+                            running_loss = 0.0
+                            log_step = 0
+
+                    # == checkpoint saving ==
+                    # uncomment below 3 lines to forcely clean cache
+                    with nsys.range("clean_cache"), timers["clean_cache"]:
+                        if ckpt_every > 0 and actual_update_step % ckpt_every == 0 and coordinator.is_master():
+                            subprocess.run("sudo drop_cache", shell=True)
+
+                    with nsys.range("checkpoint"), timers["checkpoint"]:
+                        if ckpt_every > 0 and actual_update_step % ckpt_every == 0:
+                            # mannual garbage collection
+                            gc.collect()
+
+                            save_dir = checkpoint_io.save(
+                                booster,
+                                exp_dir,
+                                model=model,
+                                ema=ema,
+                                optimizer=None,
+                                lr_scheduler=lr_scheduler,
+                                sampler=sampler,
+                                epoch=epoch,
+                                step=step + 1,
+                                global_step=global_step + 1,
+                                batch_size=cfg.get("batch_size", None),
+                                actual_update_step=actual_update_step,
+                                ema_shape_dict=ema_shape_dict,
+                                async_io=cfg.get("async_io", False),
+                                include_master_weights=save_master_weights,
                             )
-                            # tensorboard
-                            if tb_writer is not None:
-                                tb_writer.add_scalar("loss", loss, actual_update_step)
-                            # wandb
-                            if cfg.get("wandb", False):
-                                wandb_dict = {
-                                    "iter": global_step,
-                                    "acc_step": acc_step,
-                                    "epoch": epoch,
-                                    "loss": loss,
-                                    "avg_loss": avg_loss,
-                                    "lr": optimizer.param_groups[0]["lr"],
-                                    "eps": optimizer.param_groups[0]["eps"],
-                                    "global_grad_norm": optimizer.get_grad_norm(),  # test grad norm
-                                }
-                                if cfg.get("record_time", False):
-                                    wandb_dict.update(timers.to_dict())
-                                wandb.log(wandb_dict, step=actual_update_step)
 
-                        running_loss = 0.0
-                        log_step = 0
+                            if is_log_process(plugin_type, plugin_config):
+                                os.system(f"chgrp -R share {save_dir}")
 
-                # == checkpoint saving ==
-                # uncomment below 3 lines to forcely clean cache
-                with nsys.range("clean_cache"), timers["clean_cache"]:
-                    if ckpt_every > 0 and actual_update_step % ckpt_every == 0 and coordinator.is_master():
-                        subprocess.run("sudo drop_cache", shell=True)
+                            logger.info(
+                                "Saved checkpoint at epoch %s, step %s, global_step %s to %s",
+                                epoch,
+                                step + 1,
+                                actual_update_step,
+                                save_dir,
+                            )
 
-                with nsys.range("checkpoint"), timers["checkpoint"]:
-                    if ckpt_every > 0 and actual_update_step % ckpt_every == 0:
-                        # mannual garbage collection
-                        gc.collect()
+                            if mlflow_active and cfg.get("mlflow_log_checkpoints", False):
+                                mlflow_client.log_artifacts(save_dir, artifact_path=f"checkpoints/step_{actual_update_step}")
 
-                        save_dir = checkpoint_io.save(
-                            booster,
-                            exp_dir,
-                            model=model,
-                            ema=ema,
-                            optimizer=None,
-                            lr_scheduler=lr_scheduler,
-                            sampler=sampler,
-                            epoch=epoch,
-                            step=step + 1,
-                            global_step=global_step + 1,
-                            batch_size=cfg.get("batch_size", None),
-                            actual_update_step=actual_update_step,
-                            ema_shape_dict=ema_shape_dict,
-                            async_io=cfg.get("async_io", False),
-                            include_master_weights=save_master_weights,
-                        )
+                            # remove old checkpoints
+                            rm_checkpoints(exp_dir, keep_n_latest=cfg.get("keep_n_latest", -1))
+                            logger.info("Removed old checkpoints and kept %s latest ones.", cfg.get("keep_n_latest", -1))
+                    # uncomment below 3 lines to benchmark checkpoint
+                    # if ckpt_every > 0 and actual_update_step % ckpt_every == 0:
+                    #     booster.checkpoint_io._sync_io()
+                    #     checkpoint_io._sync_io()
+                    # == terminal timer ==
+                    if cfg.get("record_time", False):
+                        print(timers.to_str(epoch, step))
 
-                        if is_log_process(plugin_type, plugin_config):
-                            os.system(f"chgrp -R share {save_dir}")
+            sampler.reset()
+            start_step = 0
 
-                        logger.info(
-                            "Saved checkpoint at epoch %s, step %s, global_step %s to %s",
-                            epoch,
-                            step + 1,
-                            actual_update_step,
-                            save_dir,
-                        )
-
-                        # remove old checkpoints
-                        rm_checkpoints(exp_dir, keep_n_latest=cfg.get("keep_n_latest", -1))
-                        logger.info("Removed old checkpoints and kept %s latest ones.", cfg.get("keep_n_latest", -1))
-                # uncomment below 3 lines to benchmark checkpoint
-                # if ckpt_every > 0 and actual_update_step % ckpt_every == 0:
-                #     booster.checkpoint_io._sync_io()
-                #     checkpoint_io._sync_io()
-                # == terminal timer ==
-                if cfg.get("record_time", False):
-                    print(timers.to_str(epoch, step))
-
-        sampler.reset()
-        start_step = 0
-    log_cuda_max_memory("final")
+        log_cuda_max_memory("final")
+        run_status = "COMPLETED"
+    except Exception:
+        run_status = "FAILED"
+        raise
+    finally:
+        if mlflow_active:
+            try:
+                mlflow_client.set_tag("status", run_status)
+                mlflow_client.end_run()
+            except Exception as e:
+                logger.warning("Failed to finalize MLflow run: %s", e)
+        if coordinator.is_master() and cfg.get("wandb", False):
+            wandb.finish()
 
 if __name__ == "__main__":
     main()

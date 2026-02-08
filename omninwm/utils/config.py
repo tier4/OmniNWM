@@ -77,11 +77,16 @@ def merge_args(cfg: Config, args: argparse.Namespace) -> Config:
         if v.lower() == "none":
             v = None
         elif k in target:
-            v_type = type(target[k])
-            if v_type == bool:
+            current_value = target[k]
+            # If config default is None, do not cast via NoneType(...)
+            if current_value is None:
                 v = auto_convert(v)
             else:
-                v = type(target[k])(v)
+                v_type = type(current_value)
+                if v_type == bool:
+                    v = auto_convert(v)
+                else:
+                    v = v_type(v)
         else:
             v = auto_convert(v)
         target[k_split[-1]] = v
