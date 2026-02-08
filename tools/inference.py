@@ -155,4 +155,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            # Ensure all ranks finish pending NCCL ops before teardown.
+            try:
+                dist.barrier()
+            except Exception:
+                pass
+            dist.destroy_process_group()
