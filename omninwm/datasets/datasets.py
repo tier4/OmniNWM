@@ -7,8 +7,6 @@ from typing import Dict, Optional, Tuple, Union, Any
 from IPython import embed
 import numpy as np
 import torch
-from PIL import Image, ImageFile
-from torchvision.datasets.folder import pil_loader
 from pyquaternion import Quaternion
 import cv2
 from packaging import version as pver
@@ -18,13 +16,114 @@ from omninwm.registry import DATASETS
 from omninwm.datasets.utils import (
     load_pkl,
     build_clips,
-    get_transforms_image,
     EfficientParquet,
 )
 from omninwm.datasets.config import DatasetConfig
 
-# 确保可以加载被截断的图像
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+try:
+    from turbojpeg import TurboJPEG, TJPF_RGB
+except Exception:
+    TurboJPEG = None
+    TJPF_RGB = None
+
+_TURBOJPEG_DECODER = None
+_TURBOJPEG_DECODER_PID = None
+_RAY_GRID_CACHE = {}
+_RAY_GRID_CACHE_MAX_ITEMS = 64
+
+
+def _get_turbojpeg_decoder(enabled: bool):
+    global _TURBOJPEG_DECODER, _TURBOJPEG_DECODER_PID
+    if not enabled or TurboJPEG is None:
+        return None
+    pid = os.getpid()
+    if _TURBOJPEG_DECODER is None or _TURBOJPEG_DECODER_PID != pid:
+        try:
+            _TURBOJPEG_DECODER = TurboJPEG()
+            _TURBOJPEG_DECODER_PID = pid
+        except Exception:
+            _TURBOJPEG_DECODER = None
+            _TURBOJPEG_DECODER_PID = None
+    return _TURBOJPEG_DECODER
+
+
+def _resize_crop_to_fill_cv2(
+    image: np.ndarray,
+    target_size: Tuple[int, int],
+    interpolation: int = cv2.INTER_LINEAR,
+) -> np.ndarray:
+    """Resize+center-crop to target (H, W), equivalent to resize_crop_to_fill."""
+    h, w = image.shape[:2]
+    th, tw = target_size
+    rh, rw = th / h, tw / w
+    if rh > rw:
+        sh, sw = th, round(w * rh)
+        resized = cv2.resize(image, (sw, sh), interpolation=interpolation)
+        i, j = 0, int(round((sw - tw) / 2.0))
+    else:
+        sh, sw = round(h * rw), tw
+        resized = cv2.resize(image, (sw, sh), interpolation=interpolation)
+        i, j = int(round((sh - th) / 2.0)), 0
+    return resized[i : i + th, j : j + tw]
+
+
+def _normalize_rgb_uint8_to_tensor(image_rgb: np.ndarray) -> torch.Tensor:
+    """Convert RGB uint8 HWC image to normalized CHW tensor in [-1, 1]."""
+    image_rgb = np.ascontiguousarray(image_rgb)
+    image_t = torch.from_numpy(image_rgb).permute(2, 0, 1).float() / 255.0
+    return (image_t - 0.5) / 0.5
+
+
+def _load_rgb_tensor_cv2(
+    image_path: str, target_size: Tuple[int, int], use_turbojpeg: bool = True
+) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    """Load image with OpenCV and return normalized tensor + original (W, H)."""
+    rgb = None
+    ext = os.path.splitext(image_path)[1].lower()
+    if ext in (".jpg", ".jpeg"):
+        jpeg = _get_turbojpeg_decoder(use_turbojpeg)
+        if jpeg is not None and TJPF_RGB is not None:
+            try:
+                with open(image_path, "rb") as f:
+                    rgb = jpeg.decode(f.read(), pixel_format=TJPF_RGB)
+            except Exception:
+                rgb = None
+
+    if rgb is None:
+        bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    h, w = rgb.shape[:2]
+    rgb = _resize_crop_to_fill_cv2(rgb, target_size, interpolation=cv2.INTER_LINEAR)
+    return _normalize_rgb_uint8_to_tensor(rgb), (w, h)
+
+
+def _get_ray_grid(
+    H: int,
+    W: int,
+    device: str | torch.device,
+    dtype: torch.dtype = torch.float32,
+):
+    """Cache flattened pixel grid [1,1,HW] for ray generation."""
+    dev = torch.device(device)
+    key = (H, W, dev.type, dev.index, str(dtype))
+    cached = _RAY_GRID_CACHE.get(key, None)
+    if cached is not None:
+        return cached
+
+    j, i = torch.meshgrid(
+        torch.arange(H, device=dev, dtype=dtype),
+        torch.arange(W, device=dev, dtype=dtype),
+        indexing="ij",
+    )
+    i = i.reshape(1, 1, H * W) + 0.5
+    j = j.reshape(1, 1, H * W) + 0.5
+    if len(_RAY_GRID_CACHE) >= _RAY_GRID_CACHE_MAX_ITEMS:
+        _RAY_GRID_CACHE.pop(next(iter(_RAY_GRID_CACHE)))
+    _RAY_GRID_CACHE[key] = (i, j)
+    return i, j
 
 
 def get_ray_map_from_vla(
@@ -122,6 +221,20 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
         for key, value in self.config.__dict__.items():
             setattr(self, key, value)
 
+        # Avoid OpenCV oversubscribing CPU threads in multi-worker dataloading.
+        opencv_num_threads = int(getattr(self, "opencv_num_threads", 1))
+        if opencv_num_threads >= 0:
+            cv2.setNumThreads(opencv_num_threads)
+        try:
+            cv2.ocl.setUseOpenCL(False)
+        except Exception:
+            pass
+
+        # Small process-local path caches for repeated path parsing.
+        self._t4_path_cache = {}
+        self._seg_path_cache = {}
+        self._depth_path_cache = {}
+
         # 计算分割最大ID
         self.seg_max_id = (max(self.seg_class_map.values()) * 1000) + 500
 
@@ -159,6 +272,18 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
 
         # 初始化ray-map mask（用于几何条件层面的soft mask）
         self._init_ray_masks()
+
+        # Precompute fast segmentation lookup tables.
+        # raw seg id -> compact class id -> RGB color
+        max_seg_raw_id = max(self.seg_class_map.keys()) if self.seg_class_map else 0
+        self._seg_class_lut = np.zeros(max(256, max_seg_raw_id + 1), dtype=np.uint8)
+        for raw_id, cls_id in self.seg_class_map.items():
+            if raw_id >= 0:
+                if raw_id >= self._seg_class_lut.shape[0]:
+                    pad = raw_id + 1 - self._seg_class_lut.shape[0]
+                    self._seg_class_lut = np.pad(self._seg_class_lut, (0, pad), mode="constant")
+                self._seg_class_lut[raw_id] = cls_id
+        self._seg_color_lut = np.asarray(self.seg_color_map, dtype=np.uint8)
 
     def _load_pkl_data(self) -> None:
         """加载PKL数据并构建数据片段"""
@@ -425,13 +550,9 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
         B, V = K.shape[:2]
 
         # 创建像素网格
-        j, i = NuscenesVideoDataset.custom_meshgrid(
-            torch.linspace(0, H - 1, H, device=device, dtype=c2w.dtype),
-            torch.linspace(0, W - 1, W, device=device, dtype=c2w.dtype),
-        )
-
-        i = i.reshape([1, 1, H * W]).expand([B, V, H * W]) + 0.5
-        j = j.reshape([1, 1, H * W]).expand([B, V, H * W]) + 0.5
+        i_base, j_base = _get_ray_grid(H, W, device, dtype=c2w.dtype)
+        i = i_base.expand(B, V, H * W)
+        j = j_base.expand(B, V, H * W)
 
         # 处理翻转情况
         if flip_flag is not None and torch.sum(flip_flag).item() > 0:
@@ -463,7 +584,7 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
         rays_o = rays_o[:, :, None].expand_as(rays_d)  # B, V, HW, 3
 
         # 计算Plücker坐标
-        rays_dxo = torch.cross(rays_o, rays_d)  # B, V, HW, 3
+        rays_dxo = torch.cross(rays_o, rays_d, dim=-1)  # B, V, HW, 3
         plucker = torch.cat([rays_dxo, rays_d], dim=-1)
         plucker = plucker.reshape(B, V, H, W, 6)  # B, V, H, W, 6
 
@@ -499,6 +620,7 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
             current_camera_intrinsics = cam_info["camera_intrinsics"].copy()
         else:
             current_camera_intrinsics = cam_info["cam_intrinsic"].copy()
+        current_camera_intrinsics = current_camera_intrinsics.astype(np.float32)
 
         ori_K = torch.from_numpy(current_camera_intrinsics.copy())
 
@@ -511,23 +633,27 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
         K[1, 2] *= rh
         K[0, 2] -= j
         K[1, 2] -= i
-        K = torch.from_numpy(K)
+        K = torch.from_numpy(K.astype(np.float32, copy=False))
 
         # 计算lidar2cam变换
-        lidar2cam_r = np.linalg.inv(cam_info["sensor2lidar_rotation"])
-        lidar2cam_t = cam_info["sensor2lidar_translation"] @ lidar2cam_r.T
+        lidar2cam_r = np.linalg.inv(cam_info["sensor2lidar_rotation"]).astype(
+            np.float32
+        )
+        lidar2cam_t = (
+            cam_info["sensor2lidar_translation"].astype(np.float32) @ lidar2cam_r.T
+        )
         lidar2cam_rt = np.eye(4).astype(np.float32)
         lidar2cam_rt[:3, :3] = lidar2cam_r.T
         lidar2cam_rt[3, :3] = -lidar2cam_t
         cam2lidar = torch.from_numpy(lidar2cam_rt.T)
 
         # 计算cam2ego变换
-        cam2ego = np.eye(4)
+        cam2ego = np.eye(4, dtype=np.float32)
         cam2ego[:3, :3] = Quaternion(cam_info["sensor2ego_rotation"]).rotation_matrix
         cam2ego = torch.from_numpy(cam2ego)
 
         # 计算原始cam2ego变换（包含平移）
-        cam2ego_ori = np.eye(4)
+        cam2ego_ori = np.eye(4, dtype=np.float32)
         cam2ego_ori[:3, :3] = Quaternion(
             cam_info["sensor2ego_rotation"]
         ).rotation_matrix
@@ -535,12 +661,14 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
         cam2ego_ori = torch.from_numpy(cam2ego_ori)
 
         # 计算c2w变换
-        c2w = torch.from_numpy(np.dot(rel_ego2global_dict, cam2ego_ori.numpy()))
+        c2w = torch.from_numpy(
+            np.dot(rel_ego2global_dict, cam2ego_ori.numpy()).astype(np.float32)
+        )
 
         # 计算raymap相关参数（如果启用轨迹控制）
         raymap_params = {}
         if self.traj_ctrl:
-            front_cam2ego = np.eye(4)
+            front_cam2ego = np.eye(4, dtype=np.float32)
             front_cam2ego[:3, :3] = Quaternion(
                 data["cams"]["CAM_FRONT"]["sensor2ego_rotation"]
             ).rotation_matrix
@@ -549,15 +677,21 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
                 np.dot(front_cam2ego, np.linalg.inv(cam2ego.numpy())),
                 np.dot(rel_ego2global_dict, cam2ego.numpy()),
             )
-            raymap_c2w = torch.from_numpy(current_camera_c2w)
+            raymap_c2w = torch.from_numpy(current_camera_c2w.astype(np.float32))
 
             # 计算raymap内参
             if "camera_intrinsics" in data["cams"]["CAM_FRONT"]:
-                raymap_intrinsics = data["cams"]["CAM_FRONT"][
-                    "camera_intrinsics"
-                ].copy()
+                raymap_intrinsics = (
+                    data["cams"]["CAM_FRONT"]["camera_intrinsics"]
+                    .copy()
+                    .astype(np.float32)
+                )
             else:
-                raymap_intrinsics = data["cams"]["CAM_FRONT"]["cam_intrinsic"].copy()
+                raymap_intrinsics = (
+                    data["cams"]["CAM_FRONT"]["cam_intrinsic"]
+                    .copy()
+                    .astype(np.float32)
+                )
 
             ray_map_rh, ray_map_rw, ray_map_i, ray_map_j = self.get_resize_crop_param(
                 ori_size, (target_size[0] // 8, target_size[1] // 8)
@@ -569,7 +703,7 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
             raymap_intrinsics[1, 2] *= ray_map_rh
             raymap_intrinsics[0, 2] -= ray_map_j
             raymap_intrinsics[1, 2] -= ray_map_i
-            raymap_K = torch.from_numpy(raymap_intrinsics)
+            raymap_K = torch.from_numpy(raymap_intrinsics.astype(np.float32))
 
             raymap_params = {
                 "raymap_c2w": raymap_c2w,
@@ -587,14 +721,13 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
         }
 
     def _load_segmentation(
-        self, image_path: str, transform, target_size: Tuple[int, int]
+        self, image_path: str, target_size: Tuple[int, int]
     ) -> torch.Tensor:
         """
         加载分割掩码
 
         Args:
             image_path: 图像路径
-            transform: 图像变换
             target_size: 目标尺寸
 
         Returns:
@@ -606,32 +739,17 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
             and self.seg_root
             and hasattr(self, "t4_camera_map")
         ):
-            # T4 format: extract chunk_name and camera from image_path
-            # Parse path: .../t4_datasets/{chunk_name}/data/{camera}/{filename}.jpg
-            parts = image_path.replace("\\", "/").split("/")
-            chunk_name = ""
-            camera_name = ""
-            filename = ""
-
-            for i, part in enumerate(parts):
-                if part == "t4_datasets" and i + 1 < len(parts):
-                    chunk_name = parts[i + 1]
-                if part == "data" and i + 1 < len(parts):
-                    camera_name = parts[i + 1]
-                    if i + 2 < len(parts):
-                        filename = parts[i + 2]
-
-            # Map camera name to T4 format
-            t4_camera = self.t4_camera_map.get(camera_name, camera_name)
-
-            # Build segmentation path for SAM3
-            # SAM3 format: /mnt/nvme3/T4_datasets_sam3/{chunk_name}/{camera}/{filename}.png
-            if hasattr(self, "seg_png_format") and self.seg_png_format:
-                seg_filename = filename.replace(".jpg", ".png")
-            else:
-                seg_filename = filename
-
-            seg_path = os.path.join(self.seg_root, chunk_name, t4_camera, seg_filename)
+            seg_path = self._seg_path_cache.get(image_path)
+            if seg_path is None:
+                chunk_name, camera_name, filename = self._parse_t4_image_path(image_path)
+                t4_camera = self.t4_camera_map.get(camera_name, camera_name)
+                # SAM3 format: /mnt/nvme3/T4_datasets_sam3/{chunk_name}/{camera}/{filename}.png
+                if hasattr(self, "seg_png_format") and self.seg_png_format:
+                    seg_filename = filename.replace(".jpg", ".png")
+                else:
+                    seg_filename = filename
+                seg_path = os.path.join(self.seg_root, chunk_name, t4_camera, seg_filename)
+                self._seg_path_cache[image_path] = seg_path
         else:
             # Original nuScenes format
             seg_path = (
@@ -641,26 +759,37 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
                 .replace("/sweeps/", "/sweeps_seg/")
             )
 
-        # 加载并处理分割掩码
-        seg_mask_ori = cv2.imread(seg_path)
+        # Load segmentation as id map; T4 SAM3 masks are typically PNG id maps.
+        seg_mask_ori = cv2.imread(seg_path, cv2.IMREAD_UNCHANGED)
         if seg_mask_ori is None:
             raise FileNotFoundError(f"Segmentation file not found: {seg_path}")
 
-        seg_mask = np.zeros_like(seg_mask_ori)
-        for seg_id in np.unique(seg_mask_ori):
-            new_seg_id = self.seg_class_map.get(seg_id, 0)
-            seg_mask[seg_mask_ori[:, :, 0] == seg_id] = self.seg_color_map[new_seg_id]
+        if seg_mask_ori.ndim == 3:
+            # Keep previous behavior of using the first channel as class id source.
+            seg_ids = seg_mask_ori[:, :, 0]
+        else:
+            seg_ids = seg_mask_ori
 
-        seg_mask_img = Image.fromarray(seg_mask)
-        seg_mask_norm = transform(seg_mask_img)
+        # Vectorized remap: raw seg id -> compact class id -> RGB color.
+        if seg_ids.max(initial=0) >= self._seg_class_lut.shape[0]:
+            max_val = int(seg_ids.max())
+            pad = max_val + 1 - self._seg_class_lut.shape[0]
+            self._seg_class_lut = np.pad(self._seg_class_lut, (0, pad), mode="constant")
+        class_ids = self._seg_class_lut[seg_ids]
+        seg_mask = self._seg_color_lut[class_ids]
 
-        return seg_mask_norm, seg_mask_ori
+        seg_mask = _resize_crop_to_fill_cv2(
+            seg_mask, target_size, interpolation=cv2.INTER_NEAREST
+        )
+        seg_mask_norm = _normalize_rgb_uint8_to_tensor(seg_mask)
+
+        # Return raw id map for depth post-processing (sky mask, etc.).
+        return seg_mask_norm, seg_ids
 
     def _load_depth(
         self,
         token: str,
         view_name: str,
-        transform,
         image_shape: Tuple[int, int, int],
         image_path: str,
         seg_mask_ori: Optional[np.ndarray] = None,
@@ -671,7 +800,6 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
         Args:
             token: 数据token
             view_name: 视图名称
-            transform: 图像变换（未使用，但保留接口）
             image_shape: 图像形状 (C, H, W)
             image_path: 图像路径 (for T4 format)
             seg_mask_ori: 原始分割掩码
@@ -685,34 +813,19 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
             and self.depth_root
             and hasattr(self, "t4_camera_map")
         ):
-            # T4 format: extract chunk_name and camera from image_path
-            # Parse path: .../t4_datasets/{chunk_name}/data/{camera}/{filename}.jpg
-            parts = image_path.replace("\\", "/").split("/")
-            chunk_name = ""
-            camera_name = ""
-            filename = ""
-
-            for i, part in enumerate(parts):
-                if part == "t4_datasets" and i + 1 < len(parts):
-                    chunk_name = parts[i + 1]
-                if part == "data" and i + 1 < len(parts):
-                    camera_name = parts[i + 1]
-                    if i + 2 < len(parts):
-                        filename = parts[i + 2]
-
-            # Map camera name to T4 format
-            t4_camera = self.t4_camera_map.get(camera_name, camera_name)
-
-            # Build depth path for Prior-Depth-Anything
-            # Format: /mnt/nvme1/data/T4_datasets_priorda_depth/{chunk_name}/{camera}/{filename}.png
-            if hasattr(self, "depth_png_format") and self.depth_png_format:
-                depth_filename = filename.replace(".jpg", ".png")
-            else:
-                depth_filename = filename
-
-            depth_path = os.path.join(
-                self.depth_root, chunk_name, t4_camera, depth_filename
-            )
+            depth_path = self._depth_path_cache.get(image_path)
+            if depth_path is None:
+                chunk_name, camera_name, filename = self._parse_t4_image_path(image_path)
+                t4_camera = self.t4_camera_map.get(camera_name, camera_name)
+                # Format: /mnt/nvme1/data/T4_datasets_priorda_depth/{chunk_name}/{camera}/{filename}.png
+                if hasattr(self, "depth_png_format") and self.depth_png_format:
+                    depth_filename = filename.replace(".jpg", ".png")
+                else:
+                    depth_filename = filename
+                depth_path = os.path.join(
+                    self.depth_root, chunk_name, t4_camera, depth_filename
+                )
+                self._depth_path_cache[image_path] = depth_path
 
             # Load PNG depth
             depth_map_ori = cv2.imread(depth_path, cv2.IMREAD_ANYDEPTH)
@@ -748,7 +861,9 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
                 seg_mask_ori,
                 (image_shape[2], image_shape[1]),
                 interpolation=cv2.INTER_NEAREST,
-            )[:, :, 0]
+            )
+            if seg_mask_resize.ndim == 3:
+                seg_mask_resize = seg_mask_resize[:, :, 0]
             depth_map_resize[seg_mask_resize == 2] = self.max_depth
 
         # 归一化深度图
@@ -823,15 +938,19 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
         all_cam2lidar_list = []
         all_img_path_list = []
         all_traj_list = []
+        ray_sample_index = list(range(num_frames))[::4] if self.traj_ctrl else []
+        ray_sample_index_set = set(ray_sample_index)
 
-        # 获取图像变换
-        transform = get_transforms_image(self.transform_name, (height, width))
+        # Reuse decoded tensors within one sample when duplicated frame paths appear.
+        enable_local_cache = self.transform_name == "resize_crop"
+        image_cache = {}
+        seg_cache = {}
+        depth_cache = {}
 
         # 处理每一帧
         for frame_idx, data in enumerate(data_infos):
             # 初始化当前帧的存储列表
             video_list = []
-            ray_map_list = []
             depth_list = []
             seg_list = []
             c2w_list = []
@@ -859,9 +978,17 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
                 temp_path = self._resolve_image_path(cam_path)
 
                 # 加载并处理图像
-                image = pil_loader(temp_path)
-                ori_size = image.size
-                image = transform(image)
+                image_key = (temp_path, height, width)
+                if enable_local_cache and image_key in image_cache:
+                    image, ori_size = image_cache[image_key]
+                else:
+                    image, ori_size = _load_rgb_tensor_cv2(
+                        temp_path,
+                        (height, width),
+                        use_turbojpeg=getattr(self, "use_turbojpeg", True),
+                    )
+                    if enable_local_cache:
+                        image_cache[image_key] = (image, ori_size)
                 video_list.append(image)
                 img_path_list.append(temp_path)
 
@@ -882,9 +1009,15 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
                 # 加载分割掩码（如果启用）
                 if self.use_seg and self.is_train:
                     try:
-                        seg_mask, seg_mask_for_depth = self._load_segmentation(
-                            temp_path, transform, (height, width)
-                        )
+                        seg_key = (temp_path, height, width)
+                        if enable_local_cache and seg_key in seg_cache:
+                            seg_mask, seg_mask_for_depth = seg_cache[seg_key]
+                        else:
+                            seg_mask, seg_mask_for_depth = self._load_segmentation(
+                                temp_path, (height, width)
+                            )
+                            if enable_local_cache:
+                                seg_cache[seg_key] = (seg_mask, seg_mask_for_depth)
                         seg_list.append(seg_mask)
                     except Exception as e:
                         print(f"Failed to load segmentation for {temp_path}: {e}")
@@ -895,14 +1028,19 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
                 # 加载深度图（如果启用）
                 if self.use_depth and self.is_train:
                     try:
-                        depth_map = self._load_depth(
-                            token,
-                            view_name,
-                            transform,
-                            image.shape,
-                            temp_path,
-                            seg_mask_for_depth,
-                        )
+                        depth_key = (token, view_name, temp_path, height, width)
+                        if enable_local_cache and depth_key in depth_cache:
+                            depth_map = depth_cache[depth_key]
+                        else:
+                            depth_map = self._load_depth(
+                                token,
+                                view_name,
+                                image.shape,
+                                temp_path,
+                                seg_mask_for_depth,
+                            )
+                            if enable_local_cache:
+                                depth_cache[depth_key] = depth_map
                         depth_list.append(depth_map)
                     except Exception as e:
                         print(f"Failed to load depth for {token}/{view_name}: {e}")
@@ -920,26 +1058,6 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
                     raymap_c2w_list.append(cam_params["raymap_c2w"])
                     raymap_k_list.append(cam_params["raymap_K"])
 
-                    # 计算raymap
-                    ram_map_k = torch.zeros(1, 1, 4)
-                    ray_map_c2w = torch.zeros(1, 1, 4, 4)
-                    ray_map_c2w[0, 0] = cam_params["raymap_c2w"]
-
-                    ram_map_k[:, :, 0] = cam_params["raymap_K"][0, 0]
-                    ram_map_k[:, :, 1] = cam_params["raymap_K"][1, 1]
-                    ram_map_k[:, :, 2] = cam_params["raymap_K"][0, 2]
-                    ram_map_k[:, :, 3] = cam_params["raymap_K"][1, 2]
-
-                    ray_map_ori = self.ray_condition(
-                        ram_map_k,
-                        ray_map_c2w,
-                        image.shape[1] // 8,
-                        image.shape[2] // 8,
-                        device="cpu",
-                    )
-                    ray_map = ray_map_ori[0, 0].permute(2, 0, 1)
-                    ray_map_list.append(ray_map)
-
             # 将当前帧的数据堆叠并添加到总列表中
             multi_view_video_list.append(torch.stack(video_list))
             multi_view_depth_list.append(torch.stack(depth_list))
@@ -953,7 +1071,28 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
 
             # 处理轨迹控制相关数据
             if self.traj_ctrl:
-                multi_view_ray_map_list.append(torch.stack(ray_map_list))
+                # Ray-map is only consumed at sampled timesteps (::4). Avoid computing dropped frames.
+                if frame_idx in ray_sample_index_set:
+                    # Compute all camera ray-maps together to reduce Python/kernel launch overhead.
+                    raymap_k_t = torch.stack(raymap_k_list)  # [V, 3/4, 3/4]
+                    raymap_c2w_t = torch.stack(raymap_c2w_list)  # [V, 4, 4]
+                    ram_map_k = torch.zeros(1, raymap_k_t.shape[0], 4, dtype=raymap_k_t.dtype)
+                    ray_map_c2w = raymap_c2w_t.unsqueeze(0)
+                    ram_map_k[0, :, 0] = raymap_k_t[:, 0, 0]
+                    ram_map_k[0, :, 1] = raymap_k_t[:, 1, 1]
+                    ram_map_k[0, :, 2] = raymap_k_t[:, 0, 2]
+                    ram_map_k[0, :, 3] = raymap_k_t[:, 1, 2]
+
+                    ray_map_ori = self.ray_condition(
+                        ram_map_k,
+                        ray_map_c2w,
+                        image.shape[1] // 8,
+                        image.shape[2] // 8,
+                        device="cpu",
+                    )
+                    # [1, V, H, W, 6] -> [V, 6, H, W]
+                    ray_map_views = ray_map_ori[0].permute(0, 3, 1, 2).contiguous()
+                    multi_view_ray_map_list.append(ray_map_views)
                 raymap_k_all_list.append(torch.stack(raymap_k_list))
                 cam2ego_all_list.append(torch.stack(cam2ego_list))
                 ori_cam2ego_all_list.append(torch.stack(ori_cam2ego_list))
@@ -966,8 +1105,10 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
                 all_traj_list.append(
                     torch.cat(
                         [
-                            torch.from_numpy(rel_ego2global_dict[:3, 3])[:, None],
-                            torch.from_numpy(rel_angles)[:, None],
+                            torch.from_numpy(rel_ego2global_dict[:3, 3]).to(
+                                torch.float32
+                            )[:, None],
+                            torch.from_numpy(rel_angles).to(torch.float32)[:, None],
                         ],
                         dim=1,
                     )
@@ -1015,9 +1156,9 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
             all_traj_seq = torch.stack(all_traj_list)
             ret["traj_gt"] = all_traj_seq
 
-            # 采样raymap（每4帧取一帧）
-            sample_index = list(range(multi_view_ray_map.shape[2]))[::4]
-            multi_view_ray_map_sample = multi_view_ray_map[:, :, sample_index]
+            # ray-map is already computed only on sampled timesteps.
+            sample_index = ray_sample_index
+            multi_view_ray_map_sample = multi_view_ray_map
             multi_view_ray_map_sample = self._apply_ray_map_zeroing(
                 multi_view_ray_map_sample
             )
@@ -1088,19 +1229,19 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
         # 构建变换矩阵
         e2g_r_mat = Quaternion(e2g_r).rotation_matrix
 
-        first_e2g = np.eye(4)
-        first_e2g[:3, :3] = e2g_r_mat
-        first_e2g[:3, 3] = e2g_t
+        first_e2g = np.eye(4, dtype=np.float32)
+        first_e2g[:3, :3] = e2g_r_mat.astype(np.float32)
+        first_e2g[:3, 3] = np.asarray(e2g_t, dtype=np.float32)
 
-        current_e2g = np.eye(4)
-        current_e2g[:3, :3] = e2g_r_s_mat
-        current_e2g[:3, 3] = e2g_t_s
+        current_e2g = np.eye(4, dtype=np.float32)
+        current_e2g[:3, :3] = e2g_r_s_mat.astype(np.float32)
+        current_e2g[:3, 3] = np.asarray(e2g_t_s, dtype=np.float32)
 
         # 计算相对变换
         temp_rel_ego2global = np.dot(np.linalg.inv(first_e2g), current_e2g)
-        rel_ego2global = np.eye(4)
-        rel_ego2global[:3, :3] = temp_rel_ego2global[:3, :3]
-        rel_ego2global[:3, 3] = temp_rel_ego2global[:3, 3]
+        rel_ego2global = np.eye(4, dtype=np.float32)
+        rel_ego2global[:3, :3] = temp_rel_ego2global[:3, :3].astype(np.float32)
+        rel_ego2global[:3, 3] = temp_rel_ego2global[:3, 3].astype(np.float32)
 
         return rel_ego2global
 
@@ -1120,6 +1261,32 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
 
         return cam_path
 
+    def _parse_t4_image_path(self, image_path: str) -> Tuple[str, str, str]:
+        """
+        Parse T4 image path into (chunk_name, camera_name, filename).
+        """
+        norm_path = image_path.replace("\\", "/")
+        cached = self._t4_path_cache.get(norm_path)
+        if cached is not None:
+            return cached
+
+        parts = norm_path.split("/")
+        chunk_name = ""
+        camera_name = ""
+        filename = ""
+
+        for i, part in enumerate(parts):
+            if part == "t4_datasets" and i + 1 < len(parts):
+                chunk_name = parts[i + 1]
+            if part == "data" and i + 1 < len(parts):
+                camera_name = parts[i + 1]
+                if i + 2 < len(parts):
+                    filename = parts[i + 2]
+
+        parsed = (chunk_name, camera_name, filename)
+        self._t4_path_cache[norm_path] = parsed
+        return parsed
+
     def __getitem__(self, index: Union[int, str]) -> Dict[str, Any]:
         """
         获取数据项
@@ -1138,15 +1305,22 @@ class NuscenesVideoDataset(torch.utils.data.Dataset):
             height = self.infer_height
             width = self.infer_width
 
-        while True:
+        max_retries = int(getattr(self, "max_sample_retries", 100))
+        retries = 0
+        while retries < max_retries:
             ret = self.get_data_info(index, num_frames, height, width)
             if ret is not None:
                 return ret
             else:
-                ret = None
                 print(f"video {index}")
                 index = self._rand_another()
                 print(f"new video {index}")
+                retries += 1
+
+        raise RuntimeError(
+            f"NuscenesVideoDataset failed to fetch a valid sample after {max_retries} retries. "
+            "Please check depth/seg paths and dataset integrity."
+        )
 
     def __len__(self) -> int:
         """
@@ -1320,8 +1494,10 @@ class InferVideoDataset(torch.utils.data.Dataset):
         transform_name: str = "resize_crop",
         dataset_name: str = "nuscenes",
         memory_efficient=False,
+        use_turbojpeg: bool = True,
     ):
         self.memory_efficient = memory_efficient
+        self.use_turbojpeg = use_turbojpeg
         self.data = multi_view_intrinsics_list
         self.multi_view_path_list = multi_view_path_list
         self.multi_view_intrinsics_list = multi_view_intrinsics_list
@@ -1383,7 +1559,6 @@ class InferVideoDataset(torch.utils.data.Dataset):
         width: int,
         epsilon: float = 1e-6,
     ):
-        transform = get_transforms_image(self.transform_name, (height, width))
         camera_dict = self.multi_view_path_list[index]
         intrinsics_dict = self.multi_view_intrinsics_list[index]
         extrinsics_dict = self.multi_view_extrinsics_list[index]
@@ -1445,10 +1620,12 @@ class InferVideoDataset(torch.utils.data.Dataset):
 
             for view_name in view_order:
                 img_path = camera_dict[view_name]
-                image = pil_loader(img_path)
+                image, ori_size = _load_rgb_tensor_cv2(
+                    img_path,
+                    (height, width),
+                    use_turbojpeg=getattr(self, "use_turbojpeg", True),
+                )
                 img_path_list.append(img_path)
-                ori_size = image.size
-                image = transform(image)
                 video_list.append(image)
                 # seg_list.append(image)
                 # depth_list.append(image)

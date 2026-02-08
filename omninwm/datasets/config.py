@@ -93,3 +93,9 @@ class DatasetConfig:
     ray_mask_paths: Optional[Dict[str, str]] = None
     # When enabled, set masked ray-map region to zero instead of painting image pixels black
     ray_mask_zeroing: bool = False
+    # Use TurboJPEG for jpg/jpeg decoding when available (falls back to OpenCV).
+    use_turbojpeg: bool = True
+    # Limit OpenCV thread count per worker process to avoid CPU oversubscription.
+    opencv_num_threads: int = 1
+    # Safety bound for sample retries in __getitem__ when data is broken.
+    max_sample_retries: int = 100
