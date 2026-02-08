@@ -449,37 +449,32 @@ class SingleStreamBlockProcessor:
             num_cam = len(attn.mv_order_map)
             mv_norm_hidden_states = attn.pre_norm_mv(output)
             mv_norm_hidden_states = rearrange(mv_norm_hidden_states, '(b n) ... -> b n ...', n=num_cam)
-            temp_B = len(mv_norm_hidden_states)
-            hidden_states_in1 = []
-            hidden_states_in2 = []
-            cam_order = []
-            for key, values in attn.mv_order_map.items():
-                for value in values:
-                    hidden_states_in1.append(mv_norm_hidden_states[:, key])
-                    hidden_states_in2.append(mv_norm_hidden_states[:, value])
-                    cam_order += [key] * temp_B
+            temp_B = mv_norm_hidden_states.shape[0]
+            num_pairs = attn.mv_src_index.shape[0]
 
-            hidden_states_in1 = torch.cat(hidden_states_in1, dim=0)
-            hidden_states_in2 = torch.cat(hidden_states_in2, dim=0)
-            cam_order = torch.LongTensor(cam_order)
-            output_mv = []
-            for i in range(1, len(hidden_states_in1)+1):
-                q_mv = rearrange(attn.q_mv_proj(hidden_states_in1[i-1:i]), "B L (H D) -> B L H D", H=attn.num_heads)
-                k_mv = rearrange(attn.k_mv_proj(hidden_states_in2[i-1:i]), "B L (H D) -> B L H D", H=attn.num_heads)
-                v_mv = rearrange(attn.v_mv_mlp(hidden_states_in2[i-1:i]), "B L (H D) -> B L H D", H=attn.num_heads)
-                q_mv, k_mv = attn.norm_mv(q_mv, k_mv, v_mv)
+            # Batch all camera-pair cross-view attention calls to avoid Python-loop kernel launches.
+            hidden_states_in1 = mv_norm_hidden_states[:, attn.mv_src_index]
+            hidden_states_in2 = mv_norm_hidden_states[:, attn.mv_dst_index]
+            hidden_states_in1 = rearrange(hidden_states_in1, "b p l c -> (p b) l c")
+            hidden_states_in2 = rearrange(hidden_states_in2, "b p l c -> (p b) l c")
 
-                q_mv = rearrange(q_mv, "B L H D -> B H L D")
-                k_mv = rearrange(k_mv, "B L H D -> B H L D")
-                v_mv = rearrange(v_mv, "B L H D -> B H L D")
-                attn_mv = attention(q_mv, k_mv, v_mv, pe=pe)
-                output_mv.append(attn.linear_mv(torch.cat((attn_mv, attn.mlp_act_mv(attn_mv)), 2)))
-            output_mv = torch.cat(output_mv,dim=0)
+            q_mv = rearrange(attn.q_mv_proj(hidden_states_in1), "B L (H D) -> B L H D", H=attn.num_heads)
+            k_mv = rearrange(attn.k_mv_proj(hidden_states_in2), "B L (H D) -> B L H D", H=attn.num_heads)
+            v_mv = rearrange(attn.v_mv_mlp(hidden_states_in2), "B L (H D) -> B L H D", H=attn.num_heads)
+            q_mv, k_mv = attn.norm_mv(q_mv, k_mv, v_mv)
+            q_mv = rearrange(q_mv, "B L H D -> B H L D")
+            k_mv = rearrange(k_mv, "B L H D -> B H L D")
+            v_mv = rearrange(v_mv, "B L H D -> B H L D")
+
+            attn_mv = attention(q_mv, k_mv, v_mv, pe=pe)
+            output_mv = attn.linear_mv(torch.cat((attn_mv, attn.mlp_act_mv(attn_mv)), 2))
+            output_mv = rearrange(output_mv, "(p b) l c -> b p l c", p=num_pairs, b=temp_B)
+
             mv_attn_output = torch.zeros_like(mv_norm_hidden_states)
-
-            for cam_i in range(num_cam):
-                attn_out_mv = rearrange(output_mv[cam_order == cam_i], '(n b) ... -> b n ...', b=temp_B)
-                mv_attn_output[:, cam_i] = torch.sum(attn_out_mv, dim=1)
+            owner_index = attn.mv_owner_index.view(1, num_pairs, 1, 1).expand(
+                temp_B, num_pairs, output_mv.shape[2], output_mv.shape[3]
+            )
+            mv_attn_output.scatter_add_(1, owner_index, output_mv)
             mv_attn_output = rearrange(mv_attn_output, 'b n ... -> (b n) ...')
             output = output + attn.connector(mv_attn_output)
 
@@ -541,6 +536,29 @@ class SingleStreamBlock(nn.Module):
             self.linear_mv = nn.Linear(hidden_size*2, hidden_size)
             self.mlp_act_mv = nn.GELU(approximate="tanh")
             self.connector = zero_module(nn.Linear(hidden_size, hidden_size))
+            mv_src_index = []
+            mv_dst_index = []
+            mv_owner_index = []
+            for key, values in self.mv_order_map.items():
+                for value in values:
+                    mv_src_index.append(key)
+                    mv_dst_index.append(value)
+                    mv_owner_index.append(key)
+            self.register_buffer(
+                "mv_src_index",
+                torch.tensor(mv_src_index, dtype=torch.long),
+                persistent=False,
+            )
+            self.register_buffer(
+                "mv_dst_index",
+                torch.tensor(mv_dst_index, dtype=torch.long),
+                persistent=False,
+            )
+            self.register_buffer(
+                "mv_owner_index",
+                torch.tensor(mv_owner_index, dtype=torch.long),
+                persistent=False,
+            )
         # self.norm_mv = QKNorm(self.head_dim)
         # self.pre_norm_mv = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         # self.q_mv_proj = nn.Linear(hidden_size, hidden_size)
