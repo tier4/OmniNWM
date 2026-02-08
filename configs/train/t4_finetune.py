@@ -66,6 +66,7 @@ dataset = dict(
     depth_scale=depth_scale,
     seg_png_format=True,
     depth_png_format=True,
+    opencv_num_threads=1,
     seg_root="/mnt/nvme3/T4_datasets_sam3",
     depth_root="/mnt/nvme1/data/T4_datasets_priorda_depth",
     # robust mapping: supports both OmniNWM names and raw T4 names
@@ -185,8 +186,12 @@ freeze_strategy = dict(
 # Runtime settings
 # -----------------------------
 prefetch_factor = 2
-num_workers = 8
-num_bucket_build_workers = 8
+num_workers = 4
+persistent_workers = True
+num_bucket_build_workers = 2
+
+# Disable first-step torch.compile overhead for faster startup.
+compile_ae_encoder = False
 
 dtype = "bf16"
 plugin = "zero2"
@@ -203,7 +208,9 @@ seed = 42
 outputs = "./outputs/t4_finetune"
 epochs = 30
 log_every = 10
-ckpt_every = 500
+# Save checkpoints more frequently (by update steps, not by epoch).
+# With accumulation_steps=1, this is effectively every 100 iterations.
+ckpt_every = 100
 keep_n_latest = 20
 save_master_weights = True
 load_master_weights = True
