@@ -179,6 +179,79 @@ bash dist_train_mlp.sh configs/train/stage_2.py
 bash dist_train_mlp.sh configs/train/stage_3.py
 ```
 
+### T4 Finetuning with Local MLflow
+
+This repository now includes a complete T4 finetuning pipeline with local MLflow tracking.
+
+#### T4 Data Sources
+
+- RGB root: `--t4-root` (raw T4 scenes with `annotation/*.json` and camera files)
+- Segmentation GT (SAM3): `dataset.seg_root` (default: `/mnt/nvme3/T4_datasets_sam3`)
+- Depth GT (PriorDA): `dataset.depth_root` (default: `/mnt/nvme1/data/T4_datasets_priorda_depth`)
+- Ego-mask zeroing: same 3 masks as T4 inference (`CAM_FRONT`, `CAM_BACK_LEFT`, `CAM_BACK_RIGHT`)
+
+#### Build Train/Val Pickles
+
+```bash
+python tools/prepare_t4_dataset_train.py \
+  --t4-root /mnt/nvme2/T4_datasets \
+  --train-output data/t4_infos_train.pkl \
+  --val-output data/t4_infos_val.pkl
+```
+
+Generated pickle fields:
+- `metadata`: split statistics
+- `scene_tokens`: token sequence per scene (for clip sampling)
+- `infos`: per-frame camera records (`cams[*].data_path`, intrinsics/extrinsics, timestamp, token)
+
+Clip extraction in training:
+- dense clips: sliding window with stride 1
+- sparse clips: first `scene[::6]`, then sliding window with stride 1
+
+#### Start Local MLflow UI
+
+```bash
+bash tools/run_mlflow_local.sh
+```
+
+Default local backend/artifacts:
+- DB: `mlruns_omninwm/mlflow.db`
+- Artifacts: `mlruns_omninwm/artifacts`
+- UI: `http://<host>:5001` (default host `0.0.0.0`)
+
+#### Phase A Finetune
+
+```bash
+NPROC_PER_NODE=8 bash tools/run_t4_finetune_mlflow.sh configs/train/t4_finetune.py
+```
+
+Key properties of `configs/train/t4_finetune.py`:
+- 5-view setup (`CAM_FRONT_LEFT`, `CAM_FRONT`, `CAM_FRONT_RIGHT`, `CAM_BACK_RIGHT`, `CAM_BACK_LEFT`)
+- Stage-3 style variable buckets: `224x400@33` and `448x800@17`
+- Flexible forcing enabled (`use_multi_level_noise=True`)
+- Partial-freeze finetuning (adapters + final layer + selected cross-view layers)
+- Occupancy head not explicitly optimized (focus on video-generation objective)
+
+#### Phase B Finetune (continued training)
+
+```bash
+NPROC_PER_NODE=8 bash tools/run_t4_finetune_mlflow.sh configs/train/t4_finetune_phaseB.py \
+  --load /path/to/phaseA_checkpoint
+```
+
+`configs/train/t4_finetune_phaseB.py` keeps adapters/head trainable and additionally unfreezes late single-stream blocks (`single_blocks.34~37`) with lower LR.
+
+#### Notes
+
+- MLflow run names are fixed by default:
+  - Phase A: `omninwm_t4_phaseA`
+  - Phase B: `omninwm_t4_phaseB`
+- Override config values from CLI if needed:
+  - `--dataset.seg_root ...`
+  - `--dataset.depth_root ...`
+  - `--mlflow_tracking_uri ...`
+  - `--mlflow_artifact_location ...`
+
 ---
 
 ## 📚 Citation
