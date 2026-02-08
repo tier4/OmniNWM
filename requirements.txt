@@ -20,4 +20,5 @@ mmcv==2.2.0
 pyquaternion
 flash_attn
 pycolmap==3.13.0
+PyTurboJPEG>=1.7.0  # optional: faster jpg/jpeg decode, falls back to cv2 when unavailable
 transformers==4.52.3 # vim /opt/conda/lib/python3.11/site-packages/transformers/modeling_utils.py change "if self._tp_plan is not None and is_torch_greater_or_equal("2.3"):" to "if self._tp_plan is not None and is_torch_greater_or_equal("2.5"):"
