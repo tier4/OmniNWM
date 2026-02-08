@@ -200,3 +200,6 @@ debug_logs/
 # Local experiment tracking artifacts
 mlruns/
 mlruns_omninwm/
+
+# Paper manuscript artifacts
+paper/
