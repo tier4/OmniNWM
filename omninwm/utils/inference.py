@@ -2,6 +2,8 @@ import os
 import cv2
 import torch
 import numpy as np
+import json
+import torch.nn.functional as F
 from PIL import Image
 from enum import Enum
 import torch.nn as nn
@@ -23,6 +25,15 @@ def concat_6_views_pt(imgs, oneline=False):
         if imgs.shape[0] == 6:
             imgs_up = rearrange(imgs[:3], "NC C T H W -> C T H (NC W)")
             imgs_down = rearrange(imgs[3:], "NC C T H W -> C T H (NC W)")
+            imgs = torch.cat([imgs_up, imgs_down], dim=2)
+        elif imgs.shape[0] == 5:
+            # Keep the original 2x3 layout and pad the missing CAM_BACK slot with black.
+            imgs_up = rearrange(imgs[:3], "NC C T H W -> C T H (NC W)")
+            black_back = torch.zeros_like(imgs[:1])
+            imgs_down = rearrange(
+                torch.cat([imgs[3:4], black_back, imgs[4:5]], dim=0),
+                "NC C T H W -> C T H (NC W)",
+            )
             imgs = torch.cat([imgs_up, imgs_down], dim=2)
         elif imgs.shape[0] == 3:
             imgs = rearrange(imgs[:3], "NC C T H W -> C T H (NC W)")
@@ -251,33 +262,59 @@ def vis_input_traj(
 
     return all_traj_img
 
-def conbind_video(
-    rgb,depth=None,seg=None,traj=None,occ_video=None
-):  
-    traj_img = torch.ones_like(rgb)
-    if traj_img.shape[3] < traj.shape[3] and traj_img.shape[2] < traj.shape[2]:
-        traj_start_index = abs(traj_img.shape[3]-traj.shape[3])//2
-        traj_h_start_index = abs(traj_img.shape[2]-traj.shape[2])//2
-        traj_img = traj[:,:,:traj_img.shape[2],:traj_img.shape[3]]
-    else:
-        traj_start_index = (traj_img.shape[3]-traj.shape[3])//2
-        traj_h_start_index = (traj_img.shape[2]-traj.shape[2])//2
-        traj_img[:,:,traj_h_start_index:traj_img.shape[2]-traj_h_start_index,traj_start_index:traj_img.shape[3]-traj_start_index] = traj
+def _align_panel(panel, ref):
+    """Align panel to ref shape [C, T, H, W]."""
+    if panel is None:
+        return torch.zeros_like(ref)
 
-    if depth is not None and seg is not None:
-        cat_infer_img_left = torch.cat([rgb,depth],dim=2)
-        cat_infer_img_right = torch.cat([seg,traj_img],dim=2)
-        cat_infer_img = torch.cat([cat_infer_img_left,cat_infer_img_right],dim=3)
-    elif depth is not None and seg is None:
-        cat_infer_img = torch.cat([rgb,depth,traj_img],dim=3)
-    elif depth is None and seg is not None:
-        cat_infer_img = torch.cat([rgb,seg,traj_img],dim=3)
-    else:
-        cat_infer_img = torch.cat([rgb,traj_img],dim=3)
-    
-    if occ_video is not None:
-        cat_infer_img = torch.cat([occ_video,cat_infer_img],dim=3)
-    return cat_infer_img
+    # Channels
+    if panel.shape[0] == 1:
+        panel = panel.repeat(3, 1, 1, 1)
+    elif panel.shape[0] > 3:
+        panel = panel[:3]
+    elif panel.shape[0] < 3:
+        panel = torch.cat([panel, panel[:1].repeat(3 - panel.shape[0], 1, 1, 1)], dim=0)
+
+    # Time
+    if panel.shape[1] > ref.shape[1]:
+        panel = panel[:, : ref.shape[1]]
+    elif panel.shape[1] < ref.shape[1]:
+        pad_t = ref.shape[1] - panel.shape[1]
+        panel = torch.cat([panel, panel[:, -1:].repeat(1, pad_t, 1, 1)], dim=1)
+
+    # Spatial
+    if panel.shape[2] != ref.shape[2] or panel.shape[3] != ref.shape[3]:
+        panel = F.interpolate(
+            panel.permute(1, 0, 2, 3),
+            size=(ref.shape[2], ref.shape[3]),
+            mode="bilinear",
+            align_corners=False,
+        ).permute(1, 0, 2, 3)
+    return panel
+
+
+def conbind_video(
+    pred,
+    gt=None,
+    seg=None,
+    depth=None,
+    occ_video=None,
+    traj=None,
+):
+    """Fixed 3x2 layout:
+    Row1: pred | gt
+    Row2: seg  | depth
+    Row3: occ  | traj
+    """
+    gt = _align_panel(gt, pred)
+    seg = _align_panel(seg, pred)
+    occ_video = _align_panel(occ_video, pred)
+    depth = _align_panel(depth, pred)
+    traj = _align_panel(traj, pred)
+    row1 = torch.cat([pred, gt], dim=3)
+    row2 = torch.cat([seg, depth], dim=3)
+    row3 = torch.cat([occ_video, traj], dim=3)
+    return torch.cat([row1, row2, row3], dim=2)
 
 
 def process_occ_res(occ_output_list,voxel_size=0.2,width=1400,height=1400):
@@ -303,36 +340,41 @@ def process_multi_modal(
     rgb_video = x['rgb_video']
     depth_video = x['depth_video']
     seg_video = x['seg_video']
-    rgb_denorm = concat_6_views_pt(normalize(rgb_video))
-    sigle_modal_video_shape = rgb_denorm.shape
+    rgb_denorm = concat_6_views_pt(normalize(rgb_video.clone()))
+    single_modal_video_shape = rgb_denorm.shape
 
     occ_output_list = x.get('occ_output_list',None)
     occ_video = process_occ_res(
         occ_output_list=occ_output_list,
         voxel_size=cfg.get('voxel_size',0.2),
-        width = sigle_modal_video_shape[-1],
-        height=int(sigle_modal_video_shape[-2]*2)
+        width=single_modal_video_shape[-1],
+        height=single_modal_video_shape[-2],
     )
 
 
     depth_map = None
     seg_map = None
+    depth_vis_cat = None
 
     if depth_video is not None:
         depth_map = process_depth(
             depth_video,
             dataset.max_depth
         )
-        depth_cat = concat_6_views_pt(depth_map)
-        depth_vis = colorize(
-            depth_cat[0].numpy(),
-            cmap='magma_r',
-            vmin=0,
-            vmax=dataset.max_depth,
-        )
-        depth_vis_norm = (torch.from_numpy(depth_vis.copy()).permute(3,0,1,2)/255).to(depth_cat)
+        # Convert depth to [0,1] for visualization and keep camera layout consistent.
+        depth_vis = (depth_map / max(dataset.max_depth, 1e-6)).clamp(0.0, 1.0)
+        depth_vis_cat = concat_6_views_pt(depth_vis)
     else:
-        depth_vis_norm = None
+        depth_map = None
+        depth_vis_cat = None
+
+    gt_video = batch.get("video", None)
+    if isinstance(gt_video, torch.Tensor):
+        if gt_video.ndim == 6:
+            gt_video = gt_video[0]
+        gt_denorm = concat_6_views_pt(normalize(gt_video.clone()))
+    else:
+        gt_denorm = None
 
 
     if seg_video is not None:
@@ -354,10 +396,20 @@ def process_multi_modal(
         batch=batch,
     )
 
-    traj_vis = vis_input_traj(batch,rewards_list,height=cfg.height,width=cfg.width)
+    traj_vis = vis_input_traj(
+        batch=batch,
+        rewards_list=rewards_list,
+        height=max(single_modal_video_shape[-2] // 2, 1),
+        width=max(int(single_modal_video_shape[-1] * 2 / 3), 1),
+    )
 
     gen_vis = conbind_video(
-        rgb_denorm,depth_vis_norm,seg_vis_cat,traj_vis,occ_video
+        pred=rgb_denorm,
+        gt=gt_denorm,
+        seg=seg_vis_cat,
+        depth=depth_vis_cat,
+        occ_video=occ_video,
+        traj=traj_vis,
     )
     return gen_vis, depth_map, seg_map, occ_output_list, rewards_list
 
@@ -583,7 +635,39 @@ def process_and_save(
         devices = devices
     )
     
-    save_sample(video, save_path=save_path, fps=fps_save,normalize=False)
+    # save_sample mutates the input tensor in-place; keep frame export on an untouched copy.
+    video_for_mp4 = video.clone()
+    save_sample(video_for_mp4, save_path=save_path, fps=fps_save,normalize=False)
+    if cfg.get("save_frames", True):
+        # Save the same stitched content as frame-wise PNGs.
+        frame_dir = f"{save_path}_frames"
+        os.makedirs(frame_dir, exist_ok=True)
+        video_u8 = (
+            video.clone()
+            .mul(255)
+            .add(0.5)
+            .clamp(0, 255)
+            .permute(1, 2, 3, 0)
+            .to("cpu", torch.uint8)
+            .numpy()
+        )
+        for frame_idx, frame in enumerate(video_u8):
+            Image.fromarray(frame).save(
+                os.path.join(frame_dir, f"frame_{frame_idx:04d}.png")
+            )
+
+    if occ_map is not None:
+        occ_points = [int(len(frame_occ)) for frame_occ in occ_map]
+        occ_stats = {
+            "num_frames": int(len(occ_points)),
+            "non_empty_frames": int(sum(p > 0 for p in occ_points)),
+            "points_per_frame": occ_points,
+            "points_min": int(min(occ_points) if occ_points else 0),
+            "points_max": int(max(occ_points) if occ_points else 0),
+            "points_mean": float(sum(occ_points) / len(occ_points)) if occ_points else 0.0,
+        }
+        with open(f"{save_path}_occ_stats.json", "w", encoding="utf-8") as f:
+            json.dump(occ_stats, f, ensure_ascii=False, indent=2)
 
 
 def prepare_inference_condition(
