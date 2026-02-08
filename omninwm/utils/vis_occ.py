@@ -9,8 +9,7 @@ import torch
 
 # ---------- 颜色表 ----------
 classname_to_color = {
-    0:  (255, 255, 255),         # noise
-    # 0:  (0, 0, 0),         # noise
+    0:  (0, 0, 0),         # free/noise -> black background for clearer visibility
     1:  (112, 128, 144),   # barrier
     2:  (220, 20, 60),    # bicycle
     3:  (255, 127, 80),   # bus
@@ -105,6 +104,8 @@ def voxel2bev_image(voxels, width_pix=896, height_pix=1200):
 
     # 7. 类别 -> RGB
     bev_rgb = cls_color[bev_cls][::-1, ::-1]  # (H,W,3)
+    # Enlarge sparse occupied pixels so results are visible at a glance.
+    bev_rgb = cv2.dilate(bev_rgb, np.ones((3, 3), dtype=np.uint8), iterations=1)
 
     # 8. resize 并转 tensor
     bev_rgb = cv2.resize(bev_rgb, (width_pix, height_pix), interpolation=cv2.INTER_NEAREST)
