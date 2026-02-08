@@ -211,11 +211,20 @@ class DataloaderForVideo(DataLoader):
 # Deterministic dataloader
 def get_seed_worker(seed):
     def seed_worker(worker_id):
-        worker_seed = seed
+        worker_seed = seed + worker_id if seed is not None else None
         if seed is not None:
             np.random.seed(worker_seed)
             torch.manual_seed(worker_seed)
             random.seed(worker_seed)
+        # Prevent each worker process from spawning many CPU threads.
+        torch.set_num_threads(1)
+        try:
+            import cv2
+
+            cv2.setNumThreads(1)
+            cv2.ocl.setUseOpenCL(False)
+        except Exception:
+            pass
 
     return seed_worker
 
