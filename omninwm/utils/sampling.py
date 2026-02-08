@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from tqdm import tqdm
 import torch
+import torch.distributed as dist
 from einops import rearrange, repeat
 from mmengine.config import Config
 from torch import Tensor, nn
@@ -139,6 +140,9 @@ class I2VDenoiser(Denoiser):
     def denoise(self, model: MMDiTModel, **kwargs) -> Tensor:
         img = kwargs.pop("img")
         timesteps = kwargs.pop("timesteps")
+        show_step_bar = kwargs.pop("show_step_bar", True)
+        step_log_every = int(kwargs.pop("step_log_every", 0))
+        step_desc = kwargs.pop("step_desc", "Denoise")
         # patch size
         patch_size = kwargs.pop("patch_size", 2)
         # cond ref arguments
@@ -150,8 +154,19 @@ class I2VDenoiser(Denoiser):
         kwargs["cond"] = cond
         kwargs.pop("sigma_min")
 
+        total_steps = len(timesteps) - 1
+        step_iter = zip(timesteps[:-1], timesteps[1:])
+        if show_step_bar:
+            step_iter = tqdm(
+                step_iter,
+                total=total_steps,
+                desc=step_desc,
+                leave=False,
+                dynamic_ncols=True,
+            )
 
-        for i, (t_curr, t_next) in enumerate(tqdm(zip(timesteps[:-1], timesteps[1:]))):
+        is_rank0 = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+        for i, (t_curr, t_next) in enumerate(step_iter):
             # timesteps
             t_vec = torch.full(
                 (img.shape[0],), t_curr, dtype=img.dtype, device=img.device
@@ -165,6 +180,12 @@ class I2VDenoiser(Denoiser):
             )
             # update
             img = img + (t_next - t_curr) * pred
+            if (
+                step_log_every > 0
+                and is_rank0
+                and ((i + 1) % step_log_every == 0 or (i + 1) == total_steps)
+            ):
+                print(f"[{step_desc}] step {i + 1}/{total_steps}", flush=True)
         return img
 
 SamplingMethodDict = {
@@ -315,9 +336,12 @@ def prepare_models(
     model_vla = None
     model_vla_processer = None
 
-    if cfg.get("occ_model", None) is not None:
+    occ_cfg = cfg.get("occ_model", None)
+    if occ_cfg is None:
+        occ_cfg = cfg.get("occ", None)
+    if occ_cfg is not None:
         model_occ = build_module(
-            cfg.occ_model, MODELS, device_map=model_device, torch_dtype=dtype
+            occ_cfg, MODELS, device_map=model_device, torch_dtype=dtype
         ).eval().to(model_device)
 
     if cfg.get("vla_pretrained_path", None) is not None:
@@ -403,7 +427,8 @@ def prepare_occ_input(
     max_depth=100,
     batch_size=1,
     device='cpu',
-    batch = None
+    batch = None,
+    occ_input_size=(896, 1600),
 ):
     assert batch_size == 1, "Only Support Batch Size Equal One"
     seg_class_map = {
@@ -425,40 +450,58 @@ def prepare_occ_input(
     post_trans = []
     sensor2sensors = []
     cat_infer_img_denorm = normalize(cat_infer_img.clone())
-    cat_infer_img_denorm_for_occ = torch.clamp((cat_infer_img_denorm*255)+0.5,min=0, max=255).to("cpu", torch.uint8).permute(2,0,1,3,4)
+    cat_infer_img_denorm_for_occ = (
+        (cat_infer_img_denorm * 255.0).to(torch.float32).to("cpu").permute(2, 0, 1, 3, 4)
+    )
     _, infer_seg = process_seg(
         seg_latent=cat_infer_seg,
         seg_color_map = seg_color_map,
         devices=device
     )
     max_class = max(seg_class_map.keys()) + 1
-    mapping_array = torch.zeros(max_class)
+    mapping_array = torch.zeros(max_class, dtype=torch.float32)
     for k, v in seg_class_map.items():
         mapping_array[k] = v
-    semantic_ = mapping_array[infer_seg].permute(1,0,2,3)
+    semantic_ = mapping_array[infer_seg].permute(1, 0, 2, 3).to(torch.float32)
 
     infer_depth_resized_denorm = process_depth(
         cat_infer_depth.clone(),
         max_depth
-    ).to(torch.float32)[:,0].permute(1,0,2,3)
-    num_frame,num_cam,img_channel,img_h,img_w = cat_infer_img_denorm_for_occ.shape
-    imgs = torch.zeros(num_frame,num_cam,img_channel,900,1600)
-    gen_depths = torch.zeros(num_frame,num_cam,900,1600)
-    gen_semantics = torch.zeros(num_frame,num_cam,900,1600)
+    ).to(torch.float32)[:, 0].permute(1, 0, 2, 3)
+    num_frame, num_cam, img_channel, src_h, src_w = cat_infer_img_denorm_for_occ.shape
+    target_h, target_w = int(occ_input_size[0]), int(occ_input_size[1])
+    imgs = torch.zeros(num_frame, num_cam, img_channel, target_h, target_w)
+    gen_depths = torch.zeros(num_frame, num_cam, target_h, target_w)
+    gen_semantics = torch.zeros(num_frame, num_cam, target_h, target_w)
 
     for frame_idx in range(imgs.shape[0]):
         for cam_idx in range(imgs.shape[1]):
-            imgs[frame_idx,cam_idx] = torch.from_numpy(mmlabNormalize((F.interpolate(cat_infer_img_denorm_for_occ[frame_idx,cam_idx].unsqueeze(0), size=(900, 1600), mode='bilinear', align_corners=False).squeeze()).permute(1,2,0).numpy())).permute(2,0,1)
-            gen_depths[frame_idx,cam_idx] = F.interpolate(infer_depth_resized_denorm[frame_idx,cam_idx].unsqueeze(0).unsqueeze(0), size=(900, 1600), mode='bilinear', align_corners=False).squeeze()
-            gen_semantics[frame_idx,cam_idx] = F.interpolate(semantic_[frame_idx,cam_idx].unsqueeze(0).unsqueeze(0), size=(900, 1600), mode='bilinear', align_corners=False).squeeze()
-    imgs = imgs[:,:,:,4:,:]
-    gen_depths = gen_depths[:,:,4:,:]
-    gen_semantics = gen_semantics[:,:,4:,:]
+            rgb = F.interpolate(
+                cat_infer_img_denorm_for_occ[frame_idx, cam_idx].unsqueeze(0),
+                size=(target_h, target_w),
+                mode='bilinear',
+                align_corners=False,
+            ).squeeze(0)
+            imgs[frame_idx, cam_idx] = torch.from_numpy(
+                mmlabNormalize(rgb.permute(1, 2, 0).numpy())
+            ).permute(2, 0, 1)
+            gen_depths[frame_idx, cam_idx] = F.interpolate(
+                infer_depth_resized_denorm[frame_idx, cam_idx].unsqueeze(0).unsqueeze(0),
+                size=(target_h, target_w),
+                mode='nearest',
+            ).squeeze()
+            gen_semantics[frame_idx, cam_idx] = F.interpolate(
+                semantic_[frame_idx, cam_idx].unsqueeze(0).unsqueeze(0),
+                size=(target_h, target_w),
+                mode='nearest',
+            ).squeeze()
 
     for cam_idx in range(imgs.shape[1]):
         post_rot_0 = torch.eye(2)
         post_tran_0 = torch.zeros(2)
-        intrin = batch['ori_cam_k'].to(torch.float32)[cam_idx,0]
+        # Use intrinsics matching generated views (world-model resolution),
+        # then express resize to OCC resolution via post_rot.
+        intrin = batch['cam_k'].to(torch.float32)[cam_idx, 0]
 
         intrins.append(intrin)
         sensor2lidar = batch['cam2lidar'].to(torch.float32)[cam_idx,0].inverse().float()
@@ -466,33 +509,12 @@ def prepare_occ_input(
         rot = sensor2lidar[:3, :3]
         tran = sensor2lidar[:3, 3]
 
-        fH, fW = 896, 1600
-        # W, H = 900, 1600
-        W, H = 1600, 900
-        resize = float(fW)/float(W)
-        resize_dims = (int(W * resize), int(H * resize))
-        newW, newH = resize_dims
-        crop_h = int((1 - 0) * newH) - fH
-        crop_w = int(max(0, newW - fW) / 2)
-        crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
-        flip = False
-        rotate = 0
-
-
-        post_rot2 = post_rot_0 * resize
-        post_tran2 = post_tran_0 - torch.Tensor(crop[:2])
-
-        Ah = rotate / 180 * np.pi
-        A = torch.Tensor([
-            [np.cos(Ah), np.sin(Ah)],
-            [-np.sin(Ah), np.cos(Ah)],
-        ])
-
-        b = torch.Tensor([crop[2] - crop[0], crop[3] - crop[1]]) / 2
-        b = A.matmul(-b) + b
-
-        post_rot2 = A.matmul(post_rot2)
-        post_tran2 = A.matmul(post_tran2) + b
+        scale_x = float(target_w) / float(src_w)
+        scale_y = float(target_h) / float(src_h)
+        post_rot2 = post_rot_0.clone()
+        post_rot2[0, 0] = scale_x
+        post_rot2[1, 1] = scale_y
+        post_tran2 = post_tran_0.clone()
 
         post_tran = torch.zeros(3)
         post_rot = torch.eye(3)
@@ -815,6 +837,9 @@ def prepare_api(
                 timesteps=timesteps,
                 flow_shift=opt.flow_shift,
                 patch_size=patch_size,
+                show_step_bar=cfg.get("show_step_bar", True),
+                step_log_every=cfg.get("step_log_every", 0),
+                step_desc=f"Denoise R{round_idx + 1}/{num_round}",
             )
             x = unpack(x, opt.height, opt.width, num_frames, patch_size=patch_size)
             cat_infer_depth = None
@@ -841,6 +866,9 @@ def prepare_api(
             torch.cuda.empty_cache()
             occ_output_list = None
             if model_occ is not None:
+                occ_cfg = cfg.get("occ_model", cfg.get("occ", {}))
+                occ_data_cfg = occ_cfg.get("img_view_transformer", {}).get("data_config", {})
+                occ_input_size = tuple(occ_data_cfg.get("input_size", (896, 1600)))
                 occ_input = prepare_occ_input(
                     cat_infer_img,
                     cat_infer_depth,
@@ -849,7 +877,8 @@ def prepare_api(
                     max_depth = dataset.max_depth,
                     batch_size = cfg.get("batch_size", 1),
                     device = model_ae.device,
-                    batch = kwargs
+                    batch = kwargs,
+                    occ_input_size=occ_input_size,
                 )
                 occ_output_list = infer_occ(model_occ, occ_input)
             if vla_ray_map is not None and cfg.get('vla_frame_wise_control',False):
