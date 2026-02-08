@@ -347,16 +347,23 @@ def main():
 
     # == build dataloader ==
     cache_pin_memory = pin_memory_cache_pre_alloc_numels is not None
+    num_workers = int(cfg.get("num_workers", 4))
+    prefetch_factor = cfg.get("prefetch_factor", None)
+    persistent_workers = bool(cfg.get("persistent_workers", num_workers > 0))
+    if num_workers <= 0:
+        prefetch_factor = None
+        persistent_workers = False
     dataloader_args = dict(
         dataset=dataset,
         batch_size=cfg.get("batch_size", None),
-        num_workers=cfg.get("num_workers", 4),
+        num_workers=num_workers,
         seed=cfg.get("seed", 1024),
         shuffle=True,
         drop_last=True,
         pin_memory=True,
         process_group=get_data_parallel_group(),
-        prefetch_factor=cfg.get("prefetch_factor", None),
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers,
         cache_pin_memory=cache_pin_memory,
         num_groups=num_groups,
     )
@@ -395,7 +402,15 @@ def main():
     del model_ae.decoder
     log_cuda_memory("autoencoder")
     log_model_params(model_ae)
-    model_ae.encode = torch.compile(model_ae.encoder, dynamic=True)
+    if cfg.get("compile_ae_encoder", False):
+        logger.info(
+            "Compiling VAE encoder with torch.compile (dynamic=%s)...",
+            cfg.get("compile_ae_dynamic", True),
+        )
+        model_ae.encode = torch.compile(
+            model_ae.encoder,
+            dynamic=cfg.get("compile_ae_dynamic", True),
+        )
 
     # == setup optimizer ==
     optimizer = create_optimizer(model, cfg.optim, param_groups=optimizer_param_groups)
