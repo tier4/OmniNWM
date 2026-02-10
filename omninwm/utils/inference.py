@@ -361,9 +361,20 @@ def process_multi_modal(
             depth_video,
             dataset.max_depth
         )
-        # Convert depth to [0,1] for visualization and keep camera layout consistent.
-        depth_vis = (depth_map / max(dataset.max_depth, 1e-6)).clamp(0.0, 1.0)
-        depth_vis_cat = concat_6_views_pt(depth_vis)
+        # Keep colored depth visualization for valid pixels while preserving
+        # missing/invalid depth (value==0) as black (e.g., missing CAM_BACK in T4).
+        depth_cat = concat_6_views_pt(depth_map)
+        depth_np = depth_cat[0].cpu().numpy()
+        depth_vis = colorize(
+            depth_np,
+            cmap="magma_r",
+            vmin=0,
+            vmax=dataset.max_depth,
+        )
+        depth_vis[depth_np <= 1e-6] = 0
+        depth_vis_cat = (
+            torch.from_numpy(depth_vis.copy()).permute(3, 0, 1, 2).to(depth_cat) / 255.0
+        )
     else:
         depth_map = None
         depth_vis_cat = None
