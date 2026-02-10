@@ -97,7 +97,7 @@ def create_colossalai_plugin(
     )
     plugin_kwargs.update(kwargs)
     sp_size = plugin_kwargs.get("sp_size", 1)
-    if plugin == "zero1" or plugin == "zero2":
+    if plugin in ("zero1", "zero2"):
         assert sp_size == 1, "Zero plugin does not support sequence parallelism"
         stage = 1 if plugin == "zero1" else 2
         plugin = LowLevelZeroPlugin(

@@ -1,6 +1,7 @@
 from IPython import embed
 import gc
 import fnmatch
+import grp
 import math
 import os
 import random
@@ -73,6 +74,42 @@ from omninwm.utils.train import (
     update_ema,
 )
 torch.backends.cudnn.benchmark = False  # True leads to slow down in conv3d
+
+
+def _safe_chgrp(path: str, group_name: str, logger=None) -> None:
+    if not group_name:
+        return
+    try:
+        grp.getgrnam(group_name)
+    except KeyError:
+        msg = f"Skip chgrp for {path}: group '{group_name}' does not exist."
+        if logger is not None:
+            logger.warning(msg)
+        else:
+            print(msg)
+        return
+
+    try:
+        subprocess.run(
+            ["chgrp", "-R", group_name, path],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        msg = "Skip chgrp: command 'chgrp' not found."
+        if logger is not None:
+            logger.warning(msg)
+        else:
+            print(msg)
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.strip() if e.stderr else str(e)
+        msg = f"chgrp failed for {path}: {err}"
+        if logger is not None:
+            logger.warning(msg)
+        else:
+            print(msg)
 
 
 def _flatten_mlflow_params(data, prefix=""):
@@ -308,10 +345,11 @@ def main():
         config=cfg.to_dict(),
         exp_name=cfg.get("exp_name", None),  # useful for automatic restart to specify the exp_name
     )
+    chgrp_group = cfg.get("chgrp_group", os.environ.get("OMNINWM_CHGRP_GROUP", "share"))
 
     if is_log_process(plugin_type, plugin_config):
-        print(f"changing {exp_dir} to share")
-        os.system(f"chgrp -R share {exp_dir}")
+        print(f"changing group of {exp_dir} to {chgrp_group}")
+        _safe_chgrp(exp_dir, chgrp_group)
 
     # == init logger, tensorboard & wandb ==
     logger = create_logger(exp_dir)
@@ -874,7 +912,7 @@ def main():
                             )
 
                             if is_log_process(plugin_type, plugin_config):
-                                os.system(f"chgrp -R share {save_dir}")
+                                _safe_chgrp(save_dir, chgrp_group, logger=logger)
 
                             logger.info(
                                 "Saved checkpoint at epoch %s, step %s, global_step %s to %s",
