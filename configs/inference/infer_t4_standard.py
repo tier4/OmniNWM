@@ -36,10 +36,11 @@ batch_size = 1
 # T4 camera mapping for depth/seg loading
 T4_CAMERA_MAP = {
     "CAM_FRONT_LEFT": "CAM_FRONT_LEFT_WIDE",
-    "CAM_FRONT": "CAM_FRONT",
+    "CAM_FRONT": "CAM_FRONT_WIDE",
+    "CAM_FRONT_WIDE": "CAM_FRONT_WIDE",
     "CAM_FRONT_RIGHT": "CAM_FRONT_RIGHT_WIDE",
     "CAM_BACK_RIGHT": "CAM_BACK_RIGHT_WIDE",
-    "CAM_BACK": "CAM_FRONT",  # Using front for back
+    "CAM_BACK": "CAM_FRONT_WIDE",  # Using front for back
     "CAM_BACK_LEFT": "CAM_BACK_LEFT_WIDE",
 }
 
@@ -59,6 +60,10 @@ dataset = dict(
     depth_png_format=True,  # Prior-Depth-Anything is PNG
     seg_root="/mnt/nvme3/T4_datasets_sam3",  # SAM3 segmentation
     depth_root="/mnt/nvme1/data/T4_datasets_priorda_depth",  # Prior-Depth-Anything
+    seg_class_map={
+        0: 0, 1: 0, 2: 5, 3: 3, 4: 3, 5: 3, 6: 5, 7: 4, 8: 0,
+        9: 3, 10: 3, 11: 1, 12: 0, 13: 7, 14: 8, 15: 0, 16: 8, 17: 2,
+    },
     t4_camera_map=T4_CAMERA_MAP,  # Map OmniNWM camera names to T4 names
     traj_ctrl=traj_ctrl,
     max_depth=100,
