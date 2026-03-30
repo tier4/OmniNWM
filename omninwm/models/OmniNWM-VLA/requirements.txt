@@ -103,7 +103,7 @@ pure-eval==0.2.3
 pyarrow==19.0.1
 pycosat==0.6.6
 pycparser==2.23
-pygments==2.19.2
+pygments==2.20.0
 pyparsing==3.2.1
 pyrootutils==1.0.4
 pysocks==1.7.1
