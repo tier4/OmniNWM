@@ -136,7 +136,7 @@ torchelastic==0.2.2
 torchvision==0.20.1+cu124
 tqdm==4.67.1
 traitlets==5.14.3
-transformers==4.49.0
+transformers==5.0.0rc3
 triton==3.1.0
 truststore==0.10.4
 types-dataclasses==0.6.6
